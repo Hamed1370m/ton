@@ -48,27 +48,30 @@ td::Result<td::Ref<vm::Cell>> WalletInterface::get_init_message(const td::Ed2551
 
 td::Ref<vm::Cell> WalletInterface::create_int_message(const Gift &gift) {
   vm::CellBuilder cbi;
-  GenericAccount::store_int_message(cbi, gift.destination, gift.gramms < 0 ? 0 : gift.gramms);
+  GenericAccount::store_int_message(cbi, gift.destination, gift.gramms < 0 ? 0 : gift.gramms, gift.extra_currencies);
   if (gift.init_state.not_null()) {
     cbi.store_ones(2);
     cbi.store_ref(gift.init_state);
   } else {
     cbi.store_zeroes(1);
   }
-  cbi.store_zeroes(1);
   store_gift_message(cbi, gift);
   return cbi.finalize();
 }
 void WalletInterface::store_gift_message(vm::CellBuilder &cb, const Gift &gift) {
   if (gift.body.not_null()) {
     auto body = vm::load_cell_slice(gift.body);
-    //TODO: handle error
-    CHECK(cb.append_cellslice_bool(body));
+    if (cb.can_extend_by(1 + body.size(), body.size_refs())) {
+      CHECK(cb.store_zeroes_bool(1) && cb.append_cellslice_bool(body));
+    } else {
+      CHECK(cb.store_ones_bool(1) && cb.store_ref_bool(gift.body));
+    }
     return;
   }
 
+  cb.store_zeroes(1);
   if (gift.is_encrypted) {
-    cb.store_long(1, 32);
+    cb.store_long(EncryptedCommentOp, 32);
   } else {
     cb.store_long(0, 32);
   }

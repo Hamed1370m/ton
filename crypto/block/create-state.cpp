@@ -47,6 +47,7 @@
 #include "fift/Fift.h"
 #include "fift/Dictionary.h"
 #include "fift/SourceLookup.h"
+#include "fift/IntCtx.h"
 #include "fift/words.h"
 
 #include "td/utils/logging.h"
@@ -308,7 +309,7 @@ td::RefInt256 create_smartcontract(td::RefInt256 smc_addr, Ref<vm::Cell> code, R
   THRERR("cannot create smart-contract AccountStorage");
   Ref<vm::DataCell> storage = cb.finalize();
   vm::CellStorageStat stats;
-  PDO(stats.compute_used_storage(Ref<vm::Cell>(storage)));
+  PDO(stats.compute_used_storage(Ref<vm::Cell>(storage)).is_ok());
   if (verbosity > 2) {
     std::cerr << "storage is:\n";
     vm::load_cell_slice(storage).print_rec(std::cerr);
@@ -425,7 +426,7 @@ bool store_validator_list_hash(vm::CellBuilder& cb) {
   LOG_CHECK(vset) << "unpacked validator set is empty";
   auto ccvc = block::Config::unpack_catchain_validators_config(config_dict.lookup_ref(td::BitArray<32>{28}));
   ton::ShardIdFull shard{ton::masterchainId};
-  auto nodes = block::Config::do_compute_validator_set(ccvc, shard, *vset, now, 0);
+  auto nodes = block::Config::do_compute_validator_set(ccvc, shard, *vset, 0);
   LOG_CHECK(!nodes.empty()) << "validator node list in unpacked validator set is empty";
   auto vset_hash = block::compute_validator_set_hash(0, shard, std::move(nodes));
   LOG(DEBUG) << "initial validator set hash is " << vset_hash;
@@ -813,11 +814,16 @@ void usage(const char* progname) {
 void parse_include_path_set(std::string include_path_set, std::vector<std::string>& res) {
   td::Parser parser(include_path_set);
   while (!parser.empty()) {
-    auto path = parser.read_till_nofail(':');
+    #if TD_WINDOWS
+    auto path_separator = '@';
+    #else
+    auto path_separator = ':';
+    #endif
+    auto path = parser.read_till_nofail(path_separator);
     if (!path.empty()) {
       res.push_back(path.str());
     }
-    parser.skip_nofail(':');
+    parser.skip_nofail(path_separator);
   }
 }
 
@@ -866,8 +872,9 @@ int main(int argc, char* const argv[]) {
       case 'v':
         new_verbosity_level = VERBOSITY_NAME(FATAL) + (verbosity = td::to_integer<int>(td::Slice(optarg)));
         break;
-      case 'V':        
-        std::cout << "create-state build information: [ Commit: " << GitMetadata::CommitSHA1() << ", Date: " << GitMetadata::CommitDate() << "]\n";
+      case 'V':
+        std::cout << "create-state build information: [ Commit: " << GitMetadata::CommitSHA1()
+                  << ", Date: " << GitMetadata::CommitDate() << "]\n";
         std::exit(0);
         break;
       case 'h':

@@ -18,11 +18,10 @@
 */
 #pragma once
 #include "td/actor/actor.h"
-
-#include "adnl/adnl-ext-client.h"
+#include "lite-client/ext-client.h"
 
 namespace tonlib {
-class ExtClientOutbound : public ton::adnl::AdnlExtClient {
+class ExtClientOutbound : public liteclient::ExtClient {
  public:
   class Callback {
    public:

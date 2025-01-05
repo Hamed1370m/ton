@@ -21,6 +21,7 @@
 #include "vm/cellslice.h"
 #include "vm/stack.hpp"
 #include "common/bitstring.h"
+#include "td/utils/Random.h"
 
 #include "td/utils/bits.h"
 
@@ -1778,7 +1779,7 @@ Ref<Cell> DictionaryFixed::dict_combine_with(Ref<Cell> dict1, Ref<Cell> dict2, t
                                              int mode, int skip1, int skip2) const {
   if (dict1.is_null()) {
     assert(!skip2);
-    if ((mode & 1) && dict2.is_null()) {
+    if ((mode & 1) && dict2.not_null()) {
       throw CombineError{};
     }
     return dict2;
@@ -1853,11 +1854,11 @@ Ref<Cell> DictionaryFixed::dict_combine_with(Ref<Cell> dict1, Ref<Cell> dict2, t
     key_buffer[-1] = 0;
     // combine left subtrees
     auto c1 = dict_combine_with(label1.remainder->prefetch_ref(0), label2.remainder->prefetch_ref(0), key_buffer,
-                                n - c - 1, total_key_len, combine_func);
+                                n - c - 1, total_key_len, combine_func, mode);
     key_buffer[-1] = 1;
     // combine right subtrees
     auto c2 = dict_combine_with(label1.remainder->prefetch_ref(1), label2.remainder->prefetch_ref(1), key_buffer,
-                                n - c - 1, total_key_len, combine_func);
+                                n - c - 1, total_key_len, combine_func, mode);
     label1.remainder.clear();
     label2.remainder.clear();
     // c1 and c2 are merged left and right children of dict1 and dict2
@@ -2007,7 +2008,7 @@ bool DictionaryFixed::combine_with(DictionaryFixed& dict2) {
 
 bool DictionaryFixed::dict_check_for_each(Ref<Cell> dict, td::BitPtr key_buffer, int n, int total_key_len,
                                           const DictionaryFixed::foreach_func_t& foreach_func,
-                                          bool invert_first) const {
+                                          bool invert_first, bool shuffle) const {
   if (dict.is_null()) {
     return true;
   }
@@ -2026,26 +2027,29 @@ bool DictionaryFixed::dict_check_for_each(Ref<Cell> dict, td::BitPtr key_buffer,
   key_buffer += l + 1;
   if (l) {
     invert_first = false;
-  } else if (invert_first) {
+  }
+  bool invert = shuffle ? td::Random::fast(0, 1) == 1: invert_first;
+  if (invert) {
     std::swap(c1, c2);
   }
-  key_buffer[-1] = invert_first;
+  key_buffer[-1] = invert;
   // recursive check_foreach applied to both children
-  if (!dict_check_for_each(std::move(c1), key_buffer, n - l - 1, total_key_len, foreach_func)) {
+  if (!dict_check_for_each(std::move(c1), key_buffer, n - l - 1, total_key_len, foreach_func, false, shuffle)) {
     return false;
   }
-  key_buffer[-1] = !invert_first;
-  return dict_check_for_each(std::move(c2), key_buffer, n - l - 1, total_key_len, foreach_func);
+  key_buffer[-1] = !invert;
+  return dict_check_for_each(std::move(c2), key_buffer, n - l - 1, total_key_len, foreach_func, false, shuffle);
 }
 
-bool DictionaryFixed::check_for_each(const foreach_func_t& foreach_func, bool invert_first) {
+bool DictionaryFixed::check_for_each(const foreach_func_t& foreach_func, bool invert_first, bool shuffle) {
   force_validate();
   if (is_empty()) {
     return true;
   }
   int key_len = get_key_bits();
   unsigned char key_buffer[max_key_bytes];
-  return dict_check_for_each(get_root_cell(), td::BitPtr{key_buffer}, key_len, key_len, foreach_func, invert_first);
+  return dict_check_for_each(get_root_cell(), td::BitPtr{key_buffer}, key_len, key_len, foreach_func, invert_first,
+                             shuffle);
 }
 
 static inline bool set_bit(td::BitPtr ptr, bool value = true) {

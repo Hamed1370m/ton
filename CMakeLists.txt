@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 project(TON VERSION 0.5 LANGUAGES C CXX)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -79,8 +79,16 @@ else()
   set(HAVE_SSE42 FALSE)
 endif()
 
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED TRUE)
+set(CMAKE_CXX_EXTENSIONS FALSE)
+
 #BEGIN internal
+option(USE_EMSCRIPTEN "Use \"ON\" for config building wasm." OFF)
 option(TON_ONLY_TONLIB "Use \"ON\" to build only tonlib." OFF)
+if (USE_EMSCRIPTEN)
+  set(TON_ONLY_TONLIB true)
+endif()
 if (TON_ONLY_TONLIB)
   set(NOT_TON_ONLY_TONLIB false)
 else()
@@ -97,8 +105,18 @@ option(TON_USE_TSAN "Use \"ON\" to enable ThreadSanitizer." OFF)
 option(TON_USE_UBSAN "Use \"ON\" to enable UndefinedBehaviorSanitizer." OFF)
 set(TON_ARCH "native" CACHE STRING "Architecture, will be passed to -march=")
 
+#BEGIN M1 support
+EXECUTE_PROCESS( COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCHITECTURE )
+
+if ((ARCHITECTURE MATCHES "arm64") AND (CMAKE_SYSTEM_NAME STREQUAL "Darwin") AND
+    (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)) # only clang 13+ supports cpu=apple-m1
+    set(TON_ARCH "apple-m1")
+endif()
+#END M1 support
+
 if (TON_USE_ABSEIL)
   message("Add abseil-cpp")
+  set(ABSL_PROPAGATE_CXX_STD TRUE)
   add_subdirectory(third-party/abseil-cpp EXCLUDE_FROM_ALL)
   set(ABSL_FOUND 1)
 endif()
@@ -118,7 +136,16 @@ set(CRC32C_BUILD_BENCHMARKS OFF CACHE BOOL "Build CRC32C's benchmarks")
 set(CRC32C_USE_GLOG OFF CACHE BOOL "Build CRC32C's tests with Google Logging")
 set(CRC32C_INSTALL OFF CACHE BOOL "Install CRC32C's header and library")
 message("Add crc32c")
-add_subdirectory(third-party/crc32c EXCLUDE_FROM_ALL)
+if (NOT MSVC)
+  set(OLD_CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
+  # fix aarch64 build @ crc32c/src/crc32c_arm64_linux_check.h
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=address")
+  add_subdirectory(third-party/crc32c EXCLUDE_FROM_ALL)
+  set(CMAKE_CXX_FLAGS ${OLD_CMAKE_CXX_FLAGS})
+  unset(OLD_CMAKE_CXX_FLAGS)
+else()
+  add_subdirectory(third-party/crc32c EXCLUDE_FROM_ALL)
+endif()
 set(CRC32C_FOUND 1)
 
 if (TON_USE_ROCKSDB)
@@ -155,6 +182,9 @@ endif()
 message("Add ton")
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake" ${CMAKE_MODULE_PATH})
 
+include(BuildBLST)
+include(BuildSECP256K1)
+
 # Configure CCache if available
 find_program(CCACHE_FOUND ccache)
 #set(CCACHE_FOUND 0)
@@ -178,41 +208,40 @@ endif()
 
 include(CheckCXXCompilerFlag)
 
-if (GCC OR CLANG OR INTEL)
-  if (WIN32 AND INTEL)
-    set(STD14_FLAG /Qstd=c++14)
-  else()
-    set(STD14_FLAG -std=c++14)
-  endif()
-  check_cxx_compiler_flag(${STD14_FLAG} HAVE_STD14)
-  if (NOT HAVE_STD14)
-    string(REPLACE "c++14" "c++1y" STD14_FLAG "${STD14_FLAG}")
-    check_cxx_compiler_flag(${STD14_FLAG} HAVE_STD1Y)
-    set(HAVE_STD14 ${HAVE_STD1Y})
-  endif()
-elseif (MSVC)
-  set(HAVE_STD14 MSVC_VERSION>=1900)
-endif()
-
-if (NOT HAVE_STD14)
-  message(FATAL_ERROR "No C++14 support in the compiler. Please upgrade the compiler.")
-endif()
-
 set(CMAKE_THREAD_PREFER_PTHREAD ON)
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-find_package(ZLIB REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+if (NOT ZLIB_FOUND)
+  find_package(ZLIB REQUIRED)
+else()
+  message(STATUS "Using zlib ${ZLIB_LIBRARIES}")
+endif()
+
 
 if (TON_ARCH AND NOT MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${TON_ARCH}")
+  CHECK_CXX_COMPILER_FLAG( "-march=${TON_ARCH}" COMPILER_OPT_ARCH_SUPPORTED )
+  if (TON_ARCH STREQUAL "apple-m1")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mcpu=${TON_ARCH}")	
+  elseif(COMPILER_OPT_ARCH_SUPPORTED)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=${TON_ARCH}")
+  elseif(NOT TON_ARCH STREQUAL "native")
+    message(FATAL_ERROR "Compiler doesn't support arch ${TON_ARCH}")
+  endif()
 endif()
 if (THREADS_HAVE_PTHREAD_ARG)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 endif()
 
 if (TON_USE_JEMALLOC)
-  find_package(JeMalloc REQUIRED)
+  find_package(jemalloc REQUIRED)
 endif()
+
+if (NIX)
+  find_package(Secp256k1 REQUIRED)
+endif()
+
 
 set(MEMPROF "" CACHE STRING "Use one of \"ON\", \"FAST\" or \"SAFE\" to enable memory profiling. \
 Works under macOS and Linux when compiled using glibc. \
@@ -238,21 +267,26 @@ if (MSVC)
   add_definitions(-D_SCL_SECURE_NO_WARNINGS -D_CRT_SECURE_NO_WARNINGS)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP /W4 /wd4100 /wd4127 /wd4324 /wd4456 /wd4457 /wd4458 /wd4505 /wd4702")
 elseif (CLANG OR GCC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STD14_FLAG} -fno-omit-frame-pointer")
+  if (GCC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fstrong-eval-order=some")
+  endif()
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")
   if (APPLE)
     #use "-Wl,-exported_symbols_list,${CMAKE_CURRENT_SOURCE_DIR}/export_list" for exported symbols
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fvisibility=hidden -Wl,-dead_strip,-x,-S")
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} -fvisibility=hidden -Wl,-dead_strip,-x,-S")
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -ffunction-sections -fdata-sections")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -Wl,--exclude-libs,ALL")
+    if (NOT USE_EMSCRIPTEN)
+      set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--gc-sections -Wl,--exclude-libs,ALL")
+    endif()
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--gc-sections")
     if (NOT TON_USE_ASAN AND NOT TON_USE_TSAN AND NOT MEMPROF)
-      set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--exclude-libs,ALL")
+      if (NOT USE_EMSCRIPTEN)
+        set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--exclude-libs,ALL")
+      endif()
     endif()
   endif()
-elseif (INTEL)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STD14_FLAG}")
 endif()
 
 if (WIN32)
@@ -284,8 +318,9 @@ if (MSVC)
 endif()
 if (NOT MSVC)
   add_cxx_compiler_flag("-Wall")
+  add_cxx_compiler_flag("-Wextra")
 endif()
-add_cxx_compiler_flag("-Wextra")
+
 add_cxx_compiler_flag("-Wimplicit-fallthrough=2")
 add_cxx_compiler_flag("-Wpointer-arith")
 add_cxx_compiler_flag("-Wcast-qual")
@@ -304,6 +339,10 @@ add_cxx_compiler_flag("-Wno-sign-conversion")
 add_cxx_compiler_flag("-Qunused-arguments")
 add_cxx_compiler_flag("-Wno-unused-private-field")
 add_cxx_compiler_flag("-Wno-redundant-move")
+
+#add_cxx_compiler_flag("-Wno-unused-function")
+#add_cxx_compiler_flag("-Wno-unused-variable")
+#add_cxx_compiler_flag("-Wno-shorten-64-to-32")
 #add_cxx_compiler_flag("-Werror")
 
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -isystem /usr/include/c++/v1")
@@ -348,6 +387,9 @@ if (LATEX_FOUND)
   add_latex_document(doc/fiftbase.tex TARGET_NAME fift_basic_description)
   add_latex_document(doc/catchain.tex TARGET_NAME catchain_consensus_description)
 endif()
+if (NOT LATEX_FOUND)
+  message(STATUS "Could NOT find LATEX (this is NOT an error)")
+endif()
 #END internal
 
 function(target_link_libraries_system target)
@@ -376,6 +418,8 @@ add_subdirectory(tl-utils)
 add_subdirectory(adnl)
 add_subdirectory(crypto)
 add_subdirectory(lite-client)
+add_subdirectory(emulator)
+add_subdirectory(tolk)
 
 #BEGIN tonlib
 add_subdirectory(tonlib)
@@ -423,6 +467,13 @@ target_link_libraries(test-vm PRIVATE ton_crypto fift-lib)
 add_executable(test-smartcont test/test-td-main.cpp ${SMARTCONT_TEST_SOURCE})
 target_link_libraries(test-smartcont PRIVATE smc-envelope fift-lib ton_db)
 
+add_executable(test-bigint ${BIGINT_TEST_SOURCE})
+target_link_libraries(test-bigint PRIVATE ton_crypto)
+
+if (WINGETOPT_FOUND)
+  target_link_libraries_system(test-bigint wingetopt)
+endif()
+
 add_executable(test-cells test/test-td-main.cpp ${CELLS_TEST_SOURCE})
 target_link_libraries(test-cells PRIVATE ton_crypto)
 
@@ -444,10 +495,10 @@ target_link_libraries(test-net PRIVATE tdnet tdutils ${CMAKE_THREAD_LIBS_INIT})
 
 #BEGIN tonlib
 add_executable(test-tonlib ${TONLIB_ONLINE_TEST_SOURCE})
-target_link_libraries(test-tonlib tdutils tdactor adnllite tl_api ton_crypto ton_block tl_tonlib_api tonlib)
+target_link_libraries(test-tonlib tdactor adnllite tl_api ton_crypto tl_tonlib_api tonlib)
 
 add_executable(test-tonlib-offline test/test-td-main.cpp ${TONLIB_OFFLINE_TEST_SOURCE})
-target_link_libraries(test-tonlib-offline tdutils tdactor adnllite tl_api ton_crypto ton_block fift-lib tl_tonlib_api tonlib)
+target_link_libraries(test-tonlib-offline tdactor adnllite tl_api ton_crypto fift-lib tl_tonlib_api tonlib)
 
 if (NOT CMAKE_CROSSCOMPILING)
   add_dependencies(test-tonlib-offline gen_fif)
@@ -489,29 +540,20 @@ target_link_libraries(test-rldp2 adnl adnltest dht rldp2 tl_api)
 add_executable(test-validator-session-state test/test-validator-session-state.cpp)
 target_link_libraries(test-validator-session-state adnl dht rldp validatorsession tl_api)
 
-#add_executable(test-node test/test-node.cpp)
-#target_link_libraries(test-node overlay tdutils tdactor adnl tl_api dht
-#  catchain validatorsession)
-
+add_executable(test-overlay test/test-overlay.cpp)
+target_link_libraries(test-overlay overlay tdutils tdactor adnl adnltest tl_api dht )
 add_executable(test-catchain test/test-catchain.cpp)
 target_link_libraries(test-catchain overlay tdutils tdactor adnl adnltest rldp tl_api dht
   catchain )
-#add_executable(test-validator-session test/test-validator-session.cpp)
-#target_link_libraries(test-validator-session overlay tdutils tdactor adnl tl_api dht
-#  catchain validatorsession)
 add_executable(test-ton-collator test/test-ton-collator.cpp)
 target_link_libraries(test-ton-collator overlay tdutils tdactor adnl tl_api dht
   catchain validatorsession validator-disk ton_validator validator-disk )
-#add_executable(test-validator test/test-validator.cpp)
-#target_link_libraries(test-validator overlay tdutils tdactor adnl tl_api dht
-#    rldp catchain validatorsession ton-node validator ton_validator validator memprof ${JEMALLOC_LIBRARIES})
-#add_executable(test-ext-server test/test-ext-server.cpp)
-#target_link_libraries(test-ext-server tdutils tdactor adnl tl_api dht )
-#add_executable(test-ext-client test/test-ext-client.cpp)
-#target_link_libraries(test-ext-client tdutils tdactor adnl tl_api tl-lite-utils)
 
 add_executable(test-http test/test-http.cpp)
 target_link_libraries(test-http PRIVATE tonhttp)
+
+add_executable(test-emulator test/test-td-main.cpp emulator/test/emulator-tests.cpp)
+target_link_libraries(test-emulator PRIVATE emulator)
 
 get_directory_property(HAS_PARENT PARENT_DIRECTORY)
 if (HAS_PARENT)
@@ -523,6 +565,7 @@ if (HAS_PARENT)
           ${FEC_TEST_SOURCE}
           ${ED25519_TEST_SOURCE}
           ${TONDB_TEST_SOURCE}
+          ${BIGNUM_TEST_SOURCE}
           ${CELLS_TEST_SOURCE} # ${TONVM_TEST_SOURCE} ${FIFT_TEST_SOURCE} ${TONLIB_ONLINE_TEST_SOURCE}
           PARENT_SCOPE)
 endif()
@@ -536,17 +579,83 @@ set(TEST_OPTIONS "--regression ${CMAKE_CURRENT_SOURCE_DIR}/test/regression-tests
 separate_arguments(TEST_OPTIONS)
 add_test(test-ed25519-crypto crypto/test-ed25519-crypto)
 add_test(test-ed25519 test-ed25519)
+add_test(test-bigint test-bigint)
 add_test(test-vm test-vm ${TEST_OPTIONS})
 add_test(test-fift test-fift ${TEST_OPTIONS})
 add_test(test-cells test-cells ${TEST_OPTIONS})
 add_test(test-smartcont test-smartcont)
 add_test(test-net test-net)
 add_test(test-actors test-tdactor)
+add_test(test-emulator test-emulator)
 
 #BEGIN tonlib
 add_test(test-tdutils test-tdutils)
 add_test(test-tonlib-offline test-tonlib-offline)
 #END tonlib
+
+# FunC tests
+if (NOT NIX)
+    if (MSVC)
+      set(PYTHON_VER "python")
+    else()
+      set(PYTHON_VER "python3")
+    endif()
+    add_test(
+      NAME test-func
+      COMMAND ${PYTHON_VER} run_tests.py tests/
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/crypto/func/auto-tests)
+    if (WIN32)
+        set_property(TEST test-func PROPERTY ENVIRONMENT
+          "FUNC_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/func.exe"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift.exe"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    else()
+        set_property(TEST test-func PROPERTY ENVIRONMENT
+          "FUNC_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/func"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    endif()
+
+    add_test(
+      NAME test-func-legacy
+      COMMAND ${PYTHON_VER} legacy_tester.py
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/crypto/func/auto-tests)
+    if (WIN32)
+        set_property(TEST test-func-legacy PROPERTY ENVIRONMENT
+          "FUNC_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/func.exe"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift.exe"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    else()
+        set_property(TEST test-func-legacy PROPERTY ENVIRONMENT
+          "FUNC_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/func"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    endif()
+endif()
+
+# Tolk tests
+if (NOT NIX)
+    if (MSVC)
+      set(PYTHON_VER "python")
+    else()
+      set(PYTHON_VER "python3")
+    endif()
+    add_test(
+      NAME test-tolk
+      COMMAND ${PYTHON_VER} tolk-tester.py tests/
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/tolk-tester)
+    if (WIN32)
+        set_property(TEST test-tolk PROPERTY ENVIRONMENT
+          "TOLK_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/tolk/tolk.exe"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift.exe"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    else()
+        set_property(TEST test-tolk PROPERTY ENVIRONMENT
+          "TOLK_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/tolk/tolk"
+          "FIFT_EXECUTABLE=${CMAKE_CURRENT_BINARY_DIR}/crypto/fift"
+          "FIFTPATH=${CMAKE_CURRENT_SOURCE_DIR}/crypto/fift/lib/")
+    endif()
+endif()
 
 #BEGIN internal
 if (NOT TON_ONLY_TONLIB)
@@ -554,7 +663,7 @@ add_test(test-adnl test-adnl)
 add_test(test-dht test-dht)
 add_test(test-rldp test-rldp)
 add_test(test-rldp2 test-rldp2)
-#add_test(test-validator-session-state test-validator-session-state)
+add_test(test-validator-session-state test-validator-session-state)
 add_test(test-catchain test-catchain)
 
 add_test(test-fec test-fec)
@@ -562,4 +671,3 @@ add_test(test-tddb test-tddb ${TEST_OPTIONS})
 add_test(test-db test-db ${TEST_OPTIONS})
 endif()
 #END internal
-

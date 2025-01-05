@@ -43,9 +43,14 @@
 #include "td/utils/filesystem.h"
 #include "td/utils/port/path.h"
 
+#include "ton/ton-types.h"
+#include "ton/ton-tl.hpp"
+#include "ton/ton-io.hpp"
+
+
 #include "validator/fabric.h"
 #include "validator/impl/collator.h"
-#include "crypto/vm/cp0.h"
+#include "crypto/vm/vm.h"
 #include "crypto/block/block-db.h"
 
 #include "common/errorlog.h"
@@ -76,6 +81,9 @@ class TestNode : public td::actor::Actor {
   td::actor::ActorOwn<ton::validator::ValidatorManagerInterface> validator_manager_;
 
   std::string db_root_ = "/var/ton-work/db/";
+  std::string global_config_;
+  td::Ref<ton::validator::ValidatorManagerOptions> opts_;
+
   ton::ZeroStateIdExt zero_id_;
   td::BufferSlice bs_;
   std::vector<td::BufferSlice> ext_msgs_;
@@ -92,6 +100,10 @@ class TestNode : public td::actor::Actor {
   void set_db_root(std::string db_root) {
     db_root_ = db_root;
   }
+  void set_global_config_path(std::string path) {
+    global_config_ = path;
+  }
+
   void set_zero_root_hash(td::Bits256 hash) {
     zero_id_.root_hash = hash;
   }
@@ -218,6 +230,54 @@ class TestNode : public td::actor::Actor {
     }
   }
 
+  td::Status create_validator_options() {
+    if(!global_config_.length()) {
+      LOG(INFO) << "no global config file passed. Using zero-init config";
+      opts_ = ton::validator::ValidatorManagerOptions::create(
+        ton::BlockIdExt{ton::masterchainId, ton::shardIdAll, 0, ton::RootHash::zero(), ton::FileHash::zero()},
+        ton::BlockIdExt{ton::masterchainId, ton::shardIdAll, 0, ton::RootHash::zero(), ton::FileHash::zero()});
+     return td::Status::OK();
+    }
+    TRY_RESULT_PREFIX(conf_data, td::read_file(global_config_), "failed to read: ");
+    TRY_RESULT_PREFIX(conf_json, td::json_decode(conf_data.as_slice()), "failed to parse json: ");
+
+    ton::ton_api::config_global conf;
+    TRY_STATUS_PREFIX(ton::ton_api::from_json(conf, conf_json.get_object()), "json does not fit TL scheme: ");
+
+    auto zero_state = ton::create_block_id(conf.validator_->zero_state_);
+    ton::BlockIdExt init_block;
+    if (!conf.validator_->init_block_) {
+      LOG(INFO) << "no init block in config. using zero state";
+      init_block = zero_state;
+    } else {
+      init_block = ton::create_block_id(conf.validator_->init_block_);
+    }
+    opts_ = ton::validator::ValidatorManagerOptions::create(zero_state, init_block);
+    std::vector<ton::BlockIdExt> h;
+    for (auto &x : conf.validator_->hardforks_) {
+      auto b = ton::create_block_id(x);
+       if (!b.is_masterchain()) {
+        return td::Status::Error(ton::ErrorCode::error,
+                                 "[validator/hardforks] section contains not masterchain block id");
+      }
+      if (!b.is_valid_full()) {
+        return td::Status::Error(ton::ErrorCode::error, "[validator/hardforks] section contains invalid block_id");
+      }
+      for (auto &y : h) {
+        if (y.is_valid() && y.seqno() >= b.seqno()) {
+          y.invalidate();
+        }
+      }
+      h.push_back(b);
+    }
+    opts_.write().set_hardforks(std::move(h));
+
+
+    LOG(INFO) << "Hardforks num in config: "<< opts_->get_hardforks().size();
+    return td::Status::OK();
+  }
+
+
   void run() {
     zero_id_.workchain = ton::masterchainId;
     td::mkdir(db_root_).ensure();
@@ -227,15 +287,20 @@ class TestNode : public td::actor::Actor {
       do_save_file();
     }
 
-    auto opts = ton::validator::ValidatorManagerOptions::create(
-        ton::BlockIdExt{ton::masterchainId, ton::shardIdAll, 0, zero_id_.root_hash, zero_id_.file_hash},
-        ton::BlockIdExt{ton::masterchainId, ton::shardIdAll, 0, zero_id_.root_hash, zero_id_.file_hash});
+    auto Sr = create_validator_options();
+    if (Sr.is_error()) {
+      LOG(ERROR) << "failed to load global config'" << global_config_ << "': " << Sr;
+      std::_Exit(2);
+    }
+
+    auto opts = opts_;
+
     opts.write().set_initial_sync_disabled(true);
     validator_manager_ = ton::validator::ValidatorManagerDiskFactory::create(ton::PublicKeyHash::zero(), opts, shard_,
                                                                              shard_top_block_id_, db_root_);
     for (auto &msg : ext_msgs_) {
       td::actor::send_closure(validator_manager_, &ton::validator::ValidatorManager::new_external_message,
-                              std::move(msg));
+                              std::move(msg), 0);
     }
     for (auto &topmsg : top_shard_descrs_) {
       td::actor::send_closure(validator_manager_, &ton::validator::ValidatorManager::new_shard_block, ton::BlockIdExt{},
@@ -258,9 +323,8 @@ class TestNode : public td::actor::Actor {
         td::actor::send_closure(id_, &ton::validator::ValidatorManager::sync_complete,
                                 td::PromiseCreator::lambda([](td::Unit) {}));
       }
-      void add_shard(ton::ShardIdFull) override {
-      }
-      void del_shard(ton::ShardIdFull) override {
+      void on_new_masterchain_block(td::Ref<ton::validator::MasterchainState> state,
+                                    std::set<ton::ShardIdFull> shards_to_monitor) override {
       }
       void send_ihr_message(ton::AccountIdPrefixFull dst, td::BufferSlice data) override {
       }
@@ -282,7 +346,10 @@ class TestNode : public td::actor::Actor {
           }
         }
       }
-      void send_broadcast(ton::BlockBroadcast broadcast) override {
+      void send_block_candidate(ton::BlockIdExt block_id, ton::CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
+                                td::BufferSlice data) override {
+      }
+      void send_broadcast(ton::BlockBroadcast broadcast, int mode) override {
       }
       void download_block(ton::BlockIdExt block_id, td::uint32 priority, td::Timestamp timeout,
                           td::Promise<ton::ReceivedBlock> promise) override {
@@ -303,12 +370,18 @@ class TestNode : public td::actor::Actor {
       void get_next_key_blocks(ton::BlockIdExt block_id, td::Timestamp timeout,
                                td::Promise<std::vector<ton::BlockIdExt>> promise) override {
       }
-      void download_archive(ton::BlockSeqno masterchain_seqno, std::string tmp_dir, td::Timestamp timeout,
-
-                            td::Promise<std::string> promise) override {
+      void download_archive(ton::BlockSeqno masterchain_seqno, ton::ShardIdFull shard_prefix, std::string tmp_dir,
+                            td::Timestamp timeout, td::Promise<std::string> promise) override {
+      }
+      void download_out_msg_queue_proof(
+          ton::ShardIdFull dst_shard, std::vector<ton::BlockIdExt> blocks, block::ImportedMsgQueueLimits limits,
+          td::Timestamp timeout, td::Promise<std::vector<td::Ref<ton::validator::OutMsgQueueProof>>> promise) override {
       }
 
       void new_key_block(ton::validator::BlockHandle handle) override {
+      }
+      void send_validator_telemetry(ton::PublicKeyHash key,
+                                    ton::tl_object_ptr<ton::ton_api::validator_telemetry> telemetry) override {
       }
     };
 
@@ -343,7 +416,7 @@ int main(int argc, char *argv[]) {
   SET_VERBOSITY_LEVEL(verbosity_INFO);
   td::set_default_failure_signal_handler().ensure();
 
-  CHECK(vm::init_op_cp0());
+  vm::init_vm().ensure();
 
   td::actor::ActorOwn<TestNode> x;
 
@@ -366,6 +439,8 @@ int main(int argc, char *argv[]) {
                [&](td::Slice fname) { td::actor::send_closure(x, &TestNode::set_zero_file, fname.str()); });
   p.add_option('D', "db", "root for dbs",
                [&](td::Slice fname) { td::actor::send_closure(x, &TestNode::set_db_root, fname.str()); });
+  p.add_option('C', "config", "global config path",
+               [&](td::Slice fname) { td::actor::send_closure(x, &TestNode::set_global_config_path, fname.str()); });
   p.add_option('m', "ext-message", "binary file with serialized inbound external message",
                [&](td::Slice fname) { td::actor::send_closure(x, &TestNode::load_ext_message, fname.str()); });
   p.add_option('M', "top-shard-message", "binary file with serialized shard top block description",

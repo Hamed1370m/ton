@@ -27,15 +27,12 @@
 #include "td/utils/ThreadSafeCounter.h"
 
 #include "vm/cellslice.h"
+#include <queue>
+#include "td/actor/actor.h"
+#include "common/delay.h"
 
 namespace vm {
 namespace {
-
-class CellDbReader {
- public:
-  virtual ~CellDbReader() = default;
-  virtual td::Result<Ref<DataCell>> load_cell(td::Slice hash) = 0;
-};
 
 struct DynamicBocExtCellExtra {
   std::shared_ptr<CellDbReader> reader;
@@ -66,6 +63,20 @@ struct CellInfo {
   bool operator<(const CellInfo &other) const {
     return key() < other.key();
   }
+
+  struct Eq {
+    using is_transparent = void;  // Pred to use
+    bool operator()(const CellInfo &info, const CellInfo &other_info) const { return info.key() == other_info.key();}
+    bool operator()(const CellInfo &info, td::Slice hash) const { return info.key().as_slice() == hash;}
+    bool operator()(td::Slice hash, const CellInfo &info) const { return info.key().as_slice() == hash;}
+
+  };
+  struct Hash {
+    using is_transparent = void;  // Pred to use
+    using transparent_key_equal = Eq;
+    size_t operator()(td::Slice hash) const { return cell_hash_slice_hash(hash); }
+    size_t operator()(const CellInfo &info) const { return cell_hash_slice_hash(info.key().as_slice());}
+  };
 };
 
 bool operator<(const CellInfo &a, td::Slice b) {
@@ -92,6 +103,48 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     TRY_RESULT(loaded_cell, get_cell_info_force(hash).cell->load_cell());
     return std::move(loaded_cell.data_cell);
   }
+  td::Result<Ref<DataCell>> load_root(td::Slice hash) override {
+    return load_cell(hash);
+  }
+  td::Result<Ref<DataCell>> load_root_thread_safe(td::Slice hash) const override {
+    return td::Status::Error("Not implemented");
+  }
+  void load_cell_async(td::Slice hash, std::shared_ptr<AsyncExecutor> executor,
+                       td::Promise<Ref<DataCell>> promise) override {
+    auto promise_ptr = std::make_shared<td::Promise<Ref<DataCell>>>(std::move(promise));
+    auto info = hash_table_.get_if_exists(hash);
+    if (info && info->sync_with_db) {
+      executor->execute_async([promise = std::move(promise_ptr), cell = info->cell]() mutable {
+        TRY_RESULT_PROMISE((*promise), loaded_cell, cell->load_cell());
+        promise->set_result(loaded_cell.data_cell);
+      });
+      return;
+    }
+    SimpleExtCellCreator ext_cell_creator(cell_db_reader_);
+    executor->execute_async(
+        [executor, loader = *loader_, hash = CellHash::from_slice(hash), db = this,
+         ext_cell_creator = std::move(ext_cell_creator), promise = std::move(promise_ptr)]() mutable {
+          TRY_RESULT_PROMISE((*promise), res, loader.load(hash.as_slice(), true, ext_cell_creator));
+          if (res.status != CellLoader::LoadResult::Ok) {
+            promise->set_error(td::Status::Error("cell not found"));
+            return;
+          }
+          Ref<Cell> cell = res.cell();
+          executor->execute_sync([hash, db, res = std::move(res),
+                                  ext_cell_creator = std::move(ext_cell_creator)]() mutable {
+            db->hash_table_.apply(hash.as_slice(), [&](CellInfo &info) {
+              db->update_cell_info_loaded(info, hash.as_slice(), std::move(res));
+            });
+            for (auto &ext_cell : ext_cell_creator.get_created_cells()) {
+              auto ext_cell_hash = ext_cell->get_hash();
+              db->hash_table_.apply(ext_cell_hash.as_slice(), [&](CellInfo &info) {
+                db->update_cell_info_created_ext(info, std::move(ext_cell));
+              });
+            }
+          });
+          promise->set_result(std::move(cell));
+        });
+  }
   CellInfo &get_cell_info_force(td::Slice hash) {
     return hash_table_.apply(hash, [&](CellInfo &info) { update_cell_info_force(info, hash); });
   }
@@ -110,8 +163,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     if (cell->get_virtualization() != 0) {
       return;
     }
-    //LOG(ERROR) << "INC";
-    //CellSlice(cell, nullptr).print_rec(std::cout);
     to_inc_.push_back(cell);
   }
   void dec(const Ref<Cell> &cell) override {
@@ -121,8 +172,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     if (cell->get_virtualization() != 0) {
       return;
     }
-    //LOG(ERROR) << "DEC";
-    //CellSlice(cell, nullptr).print_rec(std::cout);
     to_dec_.push_back(cell);
   }
 
@@ -136,28 +185,26 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
   }
 
   td::Status prepare_commit() override {
+    if (pca_state_) {
+      return td::Status::Error("prepare_commit_async is not finished");
+    }
     if (is_prepared_for_commit()) {
       return td::Status::OK();
     }
-    //LOG(ERROR) << "dfs_new_cells_in_db";
     for (auto &new_cell : to_inc_) {
       auto &new_cell_info = get_cell_info(new_cell);
       dfs_new_cells_in_db(new_cell_info);
     }
-    //return td::Status::OK();
-    //LOG(ERROR) << "dfs_new_cells";
     for (auto &new_cell : to_inc_) {
       auto &new_cell_info = get_cell_info(new_cell);
       dfs_new_cells(new_cell_info);
     }
 
-    //LOG(ERROR) << "dfs_old_cells";
     for (auto &old_cell : to_dec_) {
       auto &old_cell_info = get_cell_info(old_cell);
       dfs_old_cells(old_cell_info);
     }
 
-    //LOG(ERROR) << "save_diff_prepare";
     save_diff_prepare();
 
     to_inc_.clear();
@@ -176,6 +223,10 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     return td::Status::OK();
   }
 
+  std::shared_ptr<CellDbReader> get_cell_db_reader() override {
+    return cell_db_reader_;
+  }
+
   td::Status set_loader(std::unique_ptr<CellLoader> loader) override {
     reset_cell_db_reader();
     loader_ = std::move(loader);
@@ -187,6 +238,14 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     return td::Status::OK();
   }
 
+  void set_celldb_compress_depth(td::uint32 value) override {
+    celldb_compress_depth_ = value;
+  }
+
+  vm::ExtCellCreator& as_ext_cell_creator() override {
+    return *this;
+  }
+
  private:
   std::unique_ptr<CellLoader> loader_;
   std::vector<Ref<Cell>> to_inc_;
@@ -194,11 +253,33 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
   CellHashTable<CellInfo> hash_table_;
   std::vector<CellInfo *> visited_;
   Stats stats_diff_;
+  td::uint32 celldb_compress_depth_{0};
 
   static td::NamedThreadSafeCounter::CounterRef get_thread_safe_counter() {
     static auto res = td::NamedThreadSafeCounter::get_default().get_counter("DynamicBagOfCellsDb");
     return res;
   }
+
+  class SimpleExtCellCreator : public ExtCellCreator {
+   public:
+    explicit SimpleExtCellCreator(std::shared_ptr<CellDbReader> cell_db_reader) :
+        cell_db_reader_(std::move(cell_db_reader)) {}
+
+    td::Result<Ref<Cell>> ext_cell(Cell::LevelMask level_mask, td::Slice hash, td::Slice depth) override {
+      TRY_RESULT(ext_cell, DynamicBocExtCell::create(PrunnedCellInfo{level_mask, hash, depth},
+                                                     DynamicBocExtCellExtra{cell_db_reader_}));
+      created_cells_.push_back(ext_cell);
+      return std::move(ext_cell);
+    }
+
+    std::vector<Ref<Cell>>& get_created_cells() {
+      return created_cells_;
+    }
+
+   private:
+    std::vector<Ref<Cell>> created_cells_;
+    std::shared_ptr<CellDbReader> cell_db_reader_;
+  };
 
   class CellDbReaderImpl : public CellDbReader,
                            private ExtCellCreator,
@@ -240,7 +321,9 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
         return db_->load_cell(hash);
       }
       TRY_RESULT(load_result, cell_loader_->load(hash, true, *this));
-      CHECK(load_result.status == CellLoader::LoadResult::Ok);
+      if (load_result.status != CellLoader::LoadResult::Ok) {
+        return td::Status::Error("cell not found");
+      }
       return std::move(load_result.cell());
     }
 
@@ -308,7 +391,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
       info.was = true;
       visited_.push_back(&info);
     }
-    //LOG(ERROR) << "dfs new " << td::format::escaped(info.cell->hash());
 
     if (info.was_dfs_new_cells) {
       return;
@@ -329,7 +411,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
       info.was = true;
       visited_.push_back(&info);
     }
-    //LOG(ERROR) << "dfs old " << td::format::escaped(info.cell->hash());
 
     load_cell(info);
 
@@ -350,7 +431,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
   }
 
   void save_diff(CellStorer &storer) {
-    //LOG(ERROR) << hash_table_.size();
     for (auto info_ptr : visited_) {
       save_cell(*info_ptr, storer);
     }
@@ -359,7 +439,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
 
   void save_cell_prepare(CellInfo &info) {
     if (info.refcnt_diff == 0) {
-      //CellSlice(info.cell, nullptr).print_rec(std::cout);
       return;
     }
     load_cell(info);
@@ -395,17 +474,14 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
 
     if (info.db_refcnt == 0) {
       CHECK(info.in_db);
-      //LOG(ERROR) << "ERASE";
-      //CellSlice(NoVm(), info.cell).print_rec(std::cout);
       storer.erase(info.cell->get_hash().as_slice());
       info.in_db = false;
       hash_table_.erase(info.cell->get_hash().as_slice());
       guard.dismiss();
     } else {
-      //LOG(ERROR) << "SAVE " << info.db_refcnt;
-      //CellSlice(NoVm(), info.cell).print_rec(std::cout);
       auto loaded_cell = info.cell->load_cell().move_as_ok();
-      storer.set(info.db_refcnt, *loaded_cell.data_cell);
+      storer.set(info.db_refcnt, loaded_cell.data_cell,
+                 loaded_cell.data_cell->get_depth() == celldb_compress_depth_ && celldb_compress_depth_ != 0);
       info.in_db = true;
     }
   }
@@ -427,7 +503,6 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     CHECK(cell->is_loaded());
     vm::CellSlice cs(vm::NoVm{}, cell);  // FIXME
     for (unsigned i = 0; i < cs.size_refs(); i++) {
-      //LOG(ERROR) << "---> " << td::format::escaped(cell->ref(i)->hash());
       f(get_cell_info(cs.prefetch_ref(i)));
     }
   }
@@ -486,11 +561,253 @@ class DynamicBagOfCellsDbImpl : public DynamicBagOfCellsDb, private ExtCellCreat
     info.sync_with_db = true;
   }
 
+  // same as update_cell_info_force, but with cell provided by a caller
+  void update_cell_info_loaded(CellInfo &info, td::Slice hash, CellLoader::LoadResult res) {
+    if (info.sync_with_db) {
+      return;
+    }
+    DCHECK(res.status == CellLoader::LoadResult::Ok);
+    info.cell = std::move(res.cell());
+    CHECK(info.cell->get_hash().as_slice() == hash);
+    info.in_db = true;
+    info.db_refcnt = res.refcnt();
+    info.sync_with_db = true;
+  }
+
+  // same as update_cell_info_lazy, but with cell provided by a caller
+  void update_cell_info_created_ext(CellInfo &info, Ref<Cell> cell) {
+    if (info.sync_with_db) {
+      CHECK(info.cell.not_null());
+      CHECK(info.cell->get_level_mask() == cell->get_level_mask());
+      CHECK(info.cell->get_hash() == cell->get_hash());
+      return;
+    }
+    if (info.cell.is_null()) {
+      info.cell = std::move(cell);
+      info.in_db = true;
+    }
+  }
+
   td::Result<Ref<Cell>> create_empty_ext_cell(Cell::LevelMask level_mask, td::Slice hash, td::Slice depth) {
     TRY_RESULT(res, DynamicBocExtCell::create(PrunnedCellInfo{level_mask, hash, depth},
                                               DynamicBocExtCellExtra{cell_db_reader_}));
     return std::move(res);
   }
+
+  struct PrepareCommitAsyncState {
+    size_t remaining_ = 0;
+    std::shared_ptr<AsyncExecutor> executor_;
+    td::Promise<td::Unit> promise_;
+
+    struct CellInfo2 {
+      CellInfo *info{};
+      std::vector<CellInfo2 *> parents;
+      unsigned remaining_children = 0;
+      Cell::Hash key() const {
+        return info->key();
+      }
+      bool operator<(const CellInfo2 &other) const {
+        return key() < other.key();
+      }
+
+      friend bool operator<(const CellInfo2 &a, td::Slice b) {
+        return a.key().as_slice() < b;
+      }
+
+      friend bool operator<(td::Slice a, const CellInfo2 &b) {
+        return a < b.key().as_slice();
+      }
+
+      struct Eq {
+        using is_transparent = void;  // Pred to use
+        bool operator()(const CellInfo2 &info, const CellInfo2 &other_info) const {
+          return info.key() == other_info.key();
+        }
+        bool operator()(const CellInfo2 &info, td::Slice hash) const {
+          return info.key().as_slice() == hash;
+        }
+        bool operator()(td::Slice hash, const CellInfo2 &info) const {
+          return info.key().as_slice() == hash;
+        }
+      };
+      struct Hash {
+        using is_transparent = void;  // Pred to use
+        using transparent_key_equal = Eq;
+        size_t operator()(td::Slice hash) const {
+          return cell_hash_slice_hash(hash);
+        }
+        size_t operator()(const CellInfo2 &info) const {
+          return cell_hash_slice_hash(info.key().as_slice());
+        }
+      };
+    };
+
+    CellHashTable<CellInfo2> cells_;
+
+    std::queue<CellInfo2*> load_queue_;
+    td::uint32 active_load_ = 0;
+    td::uint32 max_parallel_load_ = 4;
+  };
+  std::unique_ptr<PrepareCommitAsyncState> pca_state_;
+
+  void prepare_commit_async(std::shared_ptr<AsyncExecutor> executor, td::Promise<td::Unit> promise) override {
+    hash_table_ = {};
+    if (pca_state_) {
+      promise.set_error(td::Status::Error("Other prepare_commit_async is not finished"));
+      return;
+    }
+    if (is_prepared_for_commit()) {
+      promise.set_result(td::Unit());
+      return;
+    }
+    pca_state_ = std::make_unique<PrepareCommitAsyncState>();
+    pca_state_->executor_ = std::move(executor);
+    pca_state_->promise_ = std::move(promise);
+    for (auto &new_cell : to_inc_) {
+      dfs_new_cells_in_db_async(new_cell);
+    }
+    pca_state_->cells_.for_each([&](PrepareCommitAsyncState::CellInfo2 &info) {
+      ++pca_state_->remaining_;
+      if (info.remaining_children == 0) {
+        pca_load_from_db(&info);
+      }
+    });
+    if (pca_state_->remaining_ == 0) {
+      prepare_commit_async_cont();
+    }
+  }
+
+  void dfs_new_cells_in_db_async(const td::Ref<vm::Cell> &cell, PrepareCommitAsyncState::CellInfo2 *parent = nullptr) {
+    bool exists = true;
+    pca_state_->cells_.apply(cell->get_hash().as_slice(), [&](PrepareCommitAsyncState::CellInfo2 &info) {
+      if (info.info == nullptr) {
+        exists = false;
+        info.info = &get_cell_info(cell);
+      }
+    });
+    auto info = pca_state_->cells_.get_if_exists(cell->get_hash().as_slice());
+    if (parent) {
+      info->parents.push_back(parent);
+      ++parent->remaining_children;
+    }
+    if (exists) {
+      return;
+    }
+    if (cell->is_loaded()) {
+      vm::CellSlice cs(vm::NoVm{}, cell);
+      for (unsigned i = 0; i < cs.size_refs(); i++) {
+        dfs_new_cells_in_db_async(cs.prefetch_ref(i), info);
+      }
+    }
+  }
+
+  void pca_load_from_db(PrepareCommitAsyncState::CellInfo2 *info) {
+    if (pca_state_->active_load_ >= pca_state_->max_parallel_load_) {
+      pca_state_->load_queue_.push(info);
+      return;
+    }
+    ++pca_state_->active_load_;
+    pca_state_->executor_->execute_async(
+        [db = this, info, executor = pca_state_->executor_, loader = *loader_]() mutable {
+          auto res = loader.load_refcnt(info->info->cell->get_hash().as_slice()).move_as_ok();
+          executor->execute_sync([db, info, res = std::move(res)]() {
+            --db->pca_state_->active_load_;
+            db->pca_process_load_queue();
+            db->pca_set_in_db(info, std::move(res));
+          });
+        });
+  }
+
+  void pca_process_load_queue() {
+    while (pca_state_->active_load_ < pca_state_->max_parallel_load_ && !pca_state_->load_queue_.empty()) {
+      PrepareCommitAsyncState::CellInfo2 *info = pca_state_->load_queue_.front();
+      pca_state_->load_queue_.pop();
+      pca_load_from_db(info);
+    }
+  }
+
+  void pca_set_in_db(PrepareCommitAsyncState::CellInfo2 *info, CellLoader::LoadResult result) {
+    info->info->sync_with_db = true;
+    if (result.status == CellLoader::LoadResult::Ok) {
+      info->info->in_db = true;
+      info->info->db_refcnt = result.refcnt();
+    } else {
+      info->info->in_db = false;
+    }
+    for (PrepareCommitAsyncState::CellInfo2 *parent_info : info->parents) {
+      if (parent_info->info->sync_with_db) {
+        continue;
+      }
+      if (!info->info->in_db) {
+        pca_set_in_db(parent_info, {});
+      } else if (--parent_info->remaining_children == 0) {
+        pca_load_from_db(parent_info);
+      }
+    }
+    CHECK(pca_state_->remaining_ != 0);
+    if (--pca_state_->remaining_ == 0) {
+      prepare_commit_async_cont();
+    }
+  }
+
+  void prepare_commit_async_cont() {
+    for (auto &new_cell : to_inc_) {
+      auto &new_cell_info = get_cell_info(new_cell);
+      dfs_new_cells(new_cell_info);
+    }
+
+    CHECK(pca_state_->remaining_ == 0);
+    for (auto &old_cell : to_dec_) {
+      auto &old_cell_info = get_cell_info(old_cell);
+      dfs_old_cells_async(old_cell_info);
+    }
+    if (pca_state_->remaining_ == 0) {
+      prepare_commit_async_cont2();
+    }
+  }
+
+  void dfs_old_cells_async(CellInfo &info) {
+    if (!info.was) {
+      info.was = true;
+      visited_.push_back(&info);
+      if (!info.sync_with_db) {
+        ++pca_state_->remaining_;
+        load_cell_async(
+            info.cell->get_hash().as_slice(), pca_state_->executor_,
+            [executor = pca_state_->executor_, db = this, info = &info](td::Result<td::Ref<vm::DataCell>> R) {
+              R.ensure();
+              executor->execute_sync([db, info]() {
+                CHECK(info->sync_with_db);
+                db->dfs_old_cells_async(*info);
+                if (--db->pca_state_->remaining_ == 0) {
+                  db->prepare_commit_async_cont2();
+                }
+              });
+            });
+        return;
+      }
+    }
+    info.refcnt_diff--;
+    if (!info.sync_with_db) {
+      return;
+    }
+    auto new_refcnt = info.refcnt_diff + info.db_refcnt;
+    CHECK(new_refcnt >= 0);
+    if (new_refcnt != 0) {
+      return;
+    }
+
+    for_each(info, [this](auto &child_info) { dfs_old_cells_async(child_info); });
+  }
+
+  void prepare_commit_async_cont2() {
+    save_diff_prepare();
+    to_inc_.clear();
+    to_dec_.clear();
+    pca_state_->promise_.set_result(td::Unit());
+    pca_state_ = {};
+  }
+
 };
 }  // namespace
 

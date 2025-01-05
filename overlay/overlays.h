@@ -18,16 +18,24 @@
 */
 #pragma once
 
+#include "adnl/adnl-node-id.hpp"
 #include "adnl/adnl.h"
+#include "auto/tl/ton_api.h"
 #include "dht/dht.h"
 
+#include "td/actor/PromiseFuture.h"
 #include "td/actor/actor.h"
+#include "td/utils/Status.h"
+#include "td/utils/buffer.h"
+#include "td/utils/common.h"
 
 #include <map>
 
 namespace ton {
 
 namespace overlay {
+
+enum class OverlayType { Public, FixedMemberList, CertificatedMembers };
 
 class OverlayIdShort {
  public:
@@ -80,41 +88,68 @@ class OverlayIdFull {
   td::BufferSlice name_;
 };
 
+struct CertificateFlags {
+  enum Values : td::uint32 { AllowFec = 1, Trusted = 2 };
+};
+
+struct OverlayMemberFlags {
+  enum Values : td::uint32 { DoNotReceiveBroadcasts = 1 };
+};
+
+enum BroadcastCheckResult { Forbidden = 1, NeedCheck = 2, Allowed = 3 };
+
+inline BroadcastCheckResult broadcast_check_result_max(BroadcastCheckResult l, BroadcastCheckResult r) {
+  return static_cast<BroadcastCheckResult>(std::max(static_cast<td::int32>(l), static_cast<td::int32>(r)));
+}
+inline BroadcastCheckResult broadcast_check_result_min(BroadcastCheckResult l, BroadcastCheckResult r) {
+  return static_cast<BroadcastCheckResult>(std::min(static_cast<td::int32>(l), static_cast<td::int32>(r)));
+}
+
 class OverlayPrivacyRules {
  public:
   OverlayPrivacyRules() {
   }
   OverlayPrivacyRules(td::uint32 size) : max_unath_size_(size) {
   }
-  OverlayPrivacyRules(td::uint32 max_size, std::map<PublicKeyHash, td::uint32> authorized_keys)
-      : max_unath_size_(max_size), authorized_keys_(std::move(authorized_keys)) {
+  OverlayPrivacyRules(td::uint32 max_size, td::uint32 flags, std::map<PublicKeyHash, td::uint32> authorized_keys)
+      : max_unath_size_(max_size), flags_(flags), authorized_keys_(std::move(authorized_keys)) {
   }
 
-  td::uint32 max_size(PublicKeyHash hash) {
+  BroadcastCheckResult check_rules(PublicKeyHash hash, td::uint32 size, bool is_fec) {
     auto it = authorized_keys_.find(hash);
     if (it == authorized_keys_.end()) {
-      return max_unath_size_;
+      if (size > max_unath_size_) {
+        return BroadcastCheckResult::Forbidden;
+      }
+      if (!(flags_ & CertificateFlags::AllowFec) && is_fec) {
+        return BroadcastCheckResult::Forbidden;
+      }
+      return (flags_ & CertificateFlags::Trusted) ? BroadcastCheckResult::Allowed : BroadcastCheckResult::NeedCheck;
     } else {
-      return it->second;
+      return it->second >= size ? BroadcastCheckResult::Allowed : BroadcastCheckResult::Forbidden;
     }
   }
 
  private:
   td::uint32 max_unath_size_{0};
+  td::uint32 flags_{0};
   std::map<PublicKeyHash, td::uint32> authorized_keys_;
 };
 
 class Certificate {
  public:
-  Certificate(PublicKeyHash issued_by, td::int32 expire_at, td::uint32 max_size, td::BufferSlice signature);
-  Certificate(PublicKey issued_by, td::int32 expire_at, td::uint32 max_size, td::BufferSlice signature);
+  Certificate(PublicKeyHash issued_by, td::int32 expire_at, td::uint32 max_size, td::uint32 flags,
+              td::BufferSlice signature);
+  Certificate(PublicKey issued_by, td::int32 expire_at, td::uint32 max_size, td::uint32 flags,
+              td::BufferSlice signature);
   Certificate() {
   }
   void set_signature(td::BufferSlice signature);
   void set_issuer(PublicKey issuer);
   td::BufferSlice to_sign(OverlayIdShort overlay_id, PublicKeyHash issued_to) const;
 
-  td::Status check(PublicKeyHash node, OverlayIdShort overlay_id, td::int32 unix_time, td::uint32 size) const;
+  BroadcastCheckResult check(PublicKeyHash node, OverlayIdShort overlay_id, td::int32 unix_time, td::uint32 size,
+                             bool is_fec, bool skip_check_signature = false) const;
   tl_object_ptr<ton_api::overlay_Certificate> tl() const;
   const PublicKey &issuer() const;
   const PublicKeyHash issuer_hash() const;
@@ -126,7 +161,114 @@ class Certificate {
   td::Variant<PublicKey, PublicKeyHash> issued_by_;
   td::int32 expire_at_;
   td::uint32 max_size_;
+  td::uint32 flags_;
   td::SharedSlice signature_;
+};
+
+class OverlayMemberCertificate {
+ public:
+  OverlayMemberCertificate() {
+    expire_at_ = std::numeric_limits<td::int32>::max();
+  }
+  OverlayMemberCertificate(PublicKey signed_by, td::uint32 flags, td::int32 slot, td::int32 expire_at,
+                         td::BufferSlice signature)
+      : signed_by_(std::move(signed_by))
+      , flags_(flags)
+      , slot_(slot)
+      , expire_at_(expire_at)
+      , signature_(std::move(signature)) {
+  }
+  OverlayMemberCertificate(const OverlayMemberCertificate &other)
+      : signed_by_(other.signed_by_)
+      , flags_(other.flags_)
+      , slot_(other.slot_)
+      , expire_at_(other.expire_at_)
+      , signature_(other.signature_.clone()) {
+  }
+  OverlayMemberCertificate(OverlayMemberCertificate &&) = default;
+  OverlayMemberCertificate &operator=(OverlayMemberCertificate &&) = default;
+  OverlayMemberCertificate &operator=(const OverlayMemberCertificate &other) {
+    signed_by_ = other.signed_by_;
+    flags_ = other.flags_;
+    slot_ = other.slot_;
+    expire_at_ = other.expire_at_;
+    signature_ = other.signature_.clone();
+    return *this;
+  }
+  explicit OverlayMemberCertificate(const ton_api::overlay_MemberCertificate *cert);
+  td::Status check_signature(const adnl::AdnlNodeIdShort &node);
+
+  bool is_expired() const {
+    return expire_at_ < td::Clocks::system() - 3;
+  }
+
+  bool is_expired(double cur_time) const {
+    return expire_at_ < cur_time - 3;
+  }
+
+  tl_object_ptr<ton_api::overlay_MemberCertificate> tl() const {
+    if (empty()) {
+      return create_tl_object<ton_api::overlay_emptyMemberCertificate>();
+    }
+    return create_tl_object<ton_api::overlay_memberCertificate>(signed_by_.tl(), flags_, slot_, expire_at_,
+                                                                signature_.clone_as_buffer_slice());
+  }
+
+  const auto &issued_by() const {
+    return signed_by_;
+  }
+
+  td::Slice signature() const {
+    return signature_.as_slice();
+  }
+
+  td::BufferSlice to_sign_data(const adnl::AdnlNodeIdShort &node) const {
+    return ton::create_serialize_tl_object<ton::ton_api::overlay_memberCertificateId>(node.tl(), flags_, slot_,
+                                                                                      expire_at_);
+  }
+
+  bool empty() const {
+    return signed_by_.empty();
+  }
+
+  bool is_newer(const OverlayMemberCertificate &other) const {
+    return !empty() && expire_at_ > other.expire_at_;
+  }
+
+  auto slot() const {
+    return slot_;
+  }
+
+  auto expire_at() const {
+    return expire_at_;
+  }
+
+  void set_signature(td::Slice signature) {
+    signature_ = td::SharedSlice(signature);
+  }
+  void set_signature(td::SharedSlice signature) {
+    signature_ = std::move(signature);
+  }
+
+ private:
+  PublicKey signed_by_;
+  td::uint32 flags_;
+  td::int32 slot_;
+  td::int32 expire_at_ = std::numeric_limits<td::int32>::max();
+  td::SharedSlice signature_;
+};
+
+
+struct OverlayOptions {
+  bool announce_self_ = true;
+  bool frequent_dht_lookup_ = false;
+  td::uint32 local_overlay_member_flags_ = 0;
+  td::int32 max_slaves_in_semiprivate_overlay_ = 5;
+  td::uint32 max_peers_ = 20;
+  td::uint32 max_neighbours_ = 5;
+  td::uint32 nodes_to_send_ = 4;
+  td::uint32 propagate_broadcast_to_ = 5;
+  td::uint32 default_permanent_members_flags_ = 0;
 };
 
 class Overlays : public td::actor::Actor {
@@ -137,6 +279,13 @@ class Overlays : public td::actor::Actor {
     virtual void receive_query(adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id, td::BufferSlice data,
                                td::Promise<td::BufferSlice> promise) = 0;
     virtual void receive_broadcast(PublicKeyHash src, OverlayIdShort overlay_id, td::BufferSlice data) = 0;
+    virtual void check_broadcast(PublicKeyHash src, OverlayIdShort overlay_id, td::BufferSlice data,
+                                 td::Promise<td::Unit> promise) {
+      promise.set_value(td::Unit());
+    }
+    virtual void get_stats_extra(td::Promise<std::string> promise) {
+      promise.set_result("");
+    }
     virtual ~Callback() = default;
   };
 
@@ -154,16 +303,33 @@ class Overlays : public td::actor::Actor {
     return 1;
   }
 
+  static constexpr td::uint32 overlay_peer_ttl() {
+    return 600;
+  }
+
   static td::actor::ActorOwn<Overlays> create(std::string db_root, td::actor::ActorId<keyring::Keyring> keyring,
                                               td::actor::ActorId<adnl::Adnl> adnl, td::actor::ActorId<dht::Dht> dht);
 
   virtual void update_dht_node(td::actor::ActorId<dht::Dht> dht) = 0;
 
   virtual void create_public_overlay(adnl::AdnlNodeIdShort local_id, OverlayIdFull overlay_id,
-                                     std::unique_ptr<Callback> callback, OverlayPrivacyRules rules) = 0;
+                                     std::unique_ptr<Callback> callback, OverlayPrivacyRules rules,
+                                     td::string scope) = 0;
+  virtual void create_public_overlay_ex(adnl::AdnlNodeIdShort local_id, OverlayIdFull overlay_id,
+                                        std::unique_ptr<Callback> callback, OverlayPrivacyRules rules, td::string scope,
+                                        OverlayOptions opts) = 0;
+  virtual void create_semiprivate_overlay(adnl::AdnlNodeIdShort local_id, OverlayIdFull overlay_id,
+                                          std::vector<adnl::AdnlNodeIdShort> nodes,
+                                          std::vector<PublicKeyHash> root_public_keys,
+                                          OverlayMemberCertificate certificate,
+                                          std::unique_ptr<Callback> callback, OverlayPrivacyRules rules,
+                                          td::string scope, OverlayOptions opts) = 0;
   virtual void create_private_overlay(adnl::AdnlNodeIdShort local_id, OverlayIdFull overlay_id,
                                       std::vector<adnl::AdnlNodeIdShort> nodes, std::unique_ptr<Callback> callback,
-                                      OverlayPrivacyRules rules) = 0;
+                                      OverlayPrivacyRules rules, std::string scope) = 0;
+  virtual void create_private_overlay_ex(adnl::AdnlNodeIdShort local_id, OverlayIdFull overlay_id,
+                                         std::vector<adnl::AdnlNodeIdShort> nodes, std::unique_ptr<Callback> callback,
+                                         OverlayPrivacyRules rules, std::string scope, OverlayOptions opts) = 0;
   virtual void delete_overlay(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id) = 0;
 
   virtual void send_query(adnl::AdnlNodeIdShort dst, adnl::AdnlNodeIdShort src, OverlayIdShort overlay_id,
@@ -197,8 +363,18 @@ class Overlays : public td::actor::Actor {
   virtual void update_certificate(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id, PublicKeyHash key,
                                   std::shared_ptr<Certificate> cert) = 0;
 
+  virtual void update_member_certificate(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id,
+                                         OverlayMemberCertificate certificate) = 0;
+  virtual void update_root_member_list(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay_id,
+                                       std::vector<adnl::AdnlNodeIdShort> nodes,
+                                       std::vector<PublicKeyHash> root_public_keys,
+                                       OverlayMemberCertificate certificate) = 0;
+
   virtual void get_overlay_random_peers(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay, td::uint32 max_peers,
                                         td::Promise<std::vector<adnl::AdnlNodeIdShort>> promise) = 0;
+  virtual void get_stats(td::Promise<tl_object_ptr<ton_api::engine_validator_overlaysStats>> promise) = 0;
+
+  virtual void forget_peer(adnl::AdnlNodeIdShort local_id, OverlayIdShort overlay, adnl::AdnlNodeIdShort peer_id) = 0;
 };
 
 }  // namespace overlay

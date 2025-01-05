@@ -128,12 +128,10 @@ RefInt256 muldiv(RefInt256 x, RefInt256 y, RefInt256 z, int round_mode) {
 }
 
 std::pair<RefInt256, RefInt256> muldivmod(RefInt256 x, RefInt256 y, RefInt256 z, int round_mode) {
-  typename td::BigInt256::DoubleInt tmp{0};
+  typename td::BigInt256::DoubleInt tmp{0}, quot;
   tmp.add_mul(*x, *y);
-  RefInt256 quot{true};
-  tmp.mod_div(*z, quot.unique_write(), round_mode);
-  quot.write().normalize();
-  return std::make_pair(std::move(quot), td::make_refint(tmp));
+  tmp.mod_div(*z, quot, round_mode);
+  return std::make_pair(td::make_refint(quot.normalize()), td::make_refint(tmp));
 }
 
 RefInt256 operator&(RefInt256 x, RefInt256 y) {
@@ -261,10 +259,6 @@ int cmp(RefInt256 x, long long y) {
 
 int sgn(RefInt256 x) {
   return x->sgn();
-}
-
-RefInt256 make_refint(long long x) {
-  return td::RefInt256{true, td::Normalize(), x};
 }
 
 RefInt256 zero_refint() {

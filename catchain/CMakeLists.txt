@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0.2 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
 
 if (NOT OPENSSL_FOUND)
   find_package(OpenSSL REQUIRED)
@@ -34,6 +34,5 @@ target_include_directories(overlay PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/.. 
   ${OPENSSL_INCLUDE_DIR}
 )
-target_link_libraries(catchain PRIVATE tdutils tdactor adnl tl_api dht tdfec
-  overlay)
+target_link_libraries(catchain PRIVATE tdutils tdactor adnl tl_api dht tdfec overlay)
 

@@ -28,6 +28,7 @@
 #include "td/utils/bits.h"
 #include "td/utils/StringBuilder.h"
 #include "ton/ton-types.h"
+#include "block-auto.h"
 
 namespace block {
 
@@ -469,11 +470,17 @@ struct MsgEnvelope final : TLB_Complex {
     int cur_addr, next_addr;
     td::RefInt256 fwd_fee_remaining;
     Ref<vm::Cell> msg;
+    td::optional<ton::LogicalTime> emitted_lt;
+    td::optional<MsgMetadata> metadata;
   };
   bool unpack(vm::CellSlice& cs, Record& data) const;
   bool unpack(vm::CellSlice& cs, Record_std& data) const;
-  bool unpack_std(vm::CellSlice& cs, int& cur_a, int& nhop_a, Ref<vm::Cell>& msg) const;
-  bool get_created_lt(const vm::CellSlice& cs, unsigned long long& created_lt) const;
+  bool pack(vm::CellBuilder& cb, const Record_std& data) const;
+  bool pack_cell(td::Ref<vm::Cell>& cell, const Record_std& data) const;
+  bool get_emitted_lt(const vm::CellSlice& cs, unsigned long long& emitted_lt) const;
+  int get_tag(const vm::CellSlice& cs) const override {
+    return (int)cs.prefetch_ulong(4);
+  }
 };
 
 extern const MsgEnvelope t_MsgEnvelope;
@@ -536,7 +543,7 @@ struct Account final : TLB_Complex {
 };
 
 extern const Account t_Account, t_AccountE;
-extern const RefTo<Account> t_Ref_Account;
+extern const RefTo<Account> t_Ref_AccountE;
 
 struct AccountStatus final : TLB {
   enum { acc_state_uninit, acc_state_frozen, acc_state_active, acc_state_nonexist };
@@ -572,7 +579,7 @@ struct ShardAccount final : TLB_Complex {
     return cs.advance_ext(0x140, 1);
   }
   bool validate_skip(int* ops, vm::CellSlice& cs, bool weak = false) const override {
-    return cs.advance(0x140) && t_Ref_Account.validate_skip(ops, cs, weak);
+    return cs.advance(0x140) && t_Ref_AccountE.validate_skip(ops, cs, weak);
   }
   static bool unpack(vm::CellSlice& cs, Record& info) {
     return info.unpack(cs);
@@ -653,16 +660,20 @@ struct TrComputeInternal1 final : TLB_Complex {
 };
 
 struct ComputeSkipReason final : TLB {
-  enum { cskip_no_state = 0, cskip_bad_state = 1, cskip_no_gas = 2 };
+  enum { cskip_no_state = 0, cskip_bad_state = 1, cskip_no_gas = 2, cskip_suspended = 3 };
   int get_size(const vm::CellSlice& cs) const override {
-    return 2;
+    return cs.prefetch_ulong(2) == 3 ? 3 : 2;
   }
   bool validate_skip(int* ops, vm::CellSlice& cs, bool weak = false) const override {
-    return get_tag(cs) >= 0 && cs.advance(2);
+    int tag = get_tag(cs);
+    return tag >= 0 && cs.advance(tag == 3 ? 3 : 2);
   }
   int get_tag(const vm::CellSlice& cs) const override {
     int t = (int)cs.prefetch_ulong(2);
-    return t < 3 ? t : -1;
+    if (t == 3 && cs.prefetch_ulong(3) != 0b110) {
+      return -1;
+    }
+    return t;
   }
 };
 
@@ -797,12 +808,18 @@ struct InMsg final : TLB_Complex {
     msg_import_fin = 4,
     msg_import_tr = 5,
     msg_discard_fin = 6,
-    msg_discard_tr = 7
+    msg_discard_tr = 7,
+    msg_import_deferred_fin = 8,
+    msg_import_deferred_tr = 9
   };
   bool skip(vm::CellSlice& cs) const override;
   bool validate_skip(int* ops, vm::CellSlice& cs, bool weak = false) const override;
   int get_tag(const vm::CellSlice& cs) const override {
-    return (int)cs.prefetch_ulong(3);
+    int tag = (int)cs.prefetch_ulong(3);
+    if (tag != 1) {
+      return tag;
+    }
+    return (int)cs.prefetch_ulong(5) - 0b00100 + 8;
   }
   bool get_import_fees(vm::CellBuilder& cb, vm::CellSlice& cs) const;
 };
@@ -818,16 +835,24 @@ struct OutMsg final : TLB_Complex {
     msg_export_deq_imm = 4,
     msg_export_deq = 12,
     msg_export_deq_short = 13,
-    msg_export_tr_req = 7
+    msg_export_tr_req = 7,
+    msg_export_new_defer = 20,   // 0b10100
+    msg_export_deferred_tr = 21  // 0b10101
   };
   bool skip(vm::CellSlice& cs) const override;
   bool validate_skip(int* ops, vm::CellSlice& cs, bool weak = false) const override;
   int get_tag(const vm::CellSlice& cs) const override {
     int t = (int)cs.prefetch_ulong(3);
-    return t != 6 ? t : (int)cs.prefetch_ulong(4);
+    if (t == 6) {
+      return (int)cs.prefetch_ulong(4);
+    }
+    if (t == 5) {
+      return (int)cs.prefetch_ulong(5);
+    }
+    return t;
   }
   bool get_export_value(vm::CellBuilder& cb, vm::CellSlice& cs) const;
-  bool get_created_lt(vm::CellSlice& cs, unsigned long long& created_lt) const;
+  bool get_emitted_lt(vm::CellSlice& cs, unsigned long long& emitted_lt) const;
 };
 
 extern const OutMsg t_OutMsg;
@@ -904,6 +929,16 @@ struct Aug_OutMsgQueue final : AugmentationCheckData {
 };
 
 extern const Aug_OutMsgQueue aug_OutMsgQueue;
+
+struct Aug_DispatchQueue final : AugmentationCheckData {
+  Aug_DispatchQueue() : AugmentationCheckData(gen::t_AccountDispatchQueue, t_uint64) {
+  }
+  bool eval_fork(vm::CellBuilder& cb, vm::CellSlice& left_cs, vm::CellSlice& right_cs) const override;
+  bool eval_empty(vm::CellBuilder& cb) const override;
+  bool eval_leaf(vm::CellBuilder& cb, vm::CellSlice& cs) const override;
+};
+
+extern const Aug_DispatchQueue aug_DispatchQueue;
 
 struct OutMsgQueue final : TLB_Complex {
   HashmapAugE dict_type;
@@ -982,7 +1017,7 @@ struct ShardIdent::Record {
   int shard_pfx_bits;
   int workchain_id;
   unsigned long long shard_prefix;
-  Record() : shard_pfx_bits(-1) {
+  Record() : shard_pfx_bits(-1), workchain_id(ton::workchainInvalid), shard_prefix(0) {
   }
   Record(int _pfxlen, int _wcid, unsigned long long _pfx)
       : shard_pfx_bits(_pfxlen), workchain_id(_wcid), shard_prefix(_pfx) {
@@ -1108,6 +1143,10 @@ struct Aug_ShardFees final : AugmentationCheckData {
 };
 
 extern const Aug_ShardFees aug_ShardFees;
+
+// Validate dict of libraries in message: used when sending and receiving message
+bool validate_message_libs(const td::Ref<vm::Cell> &cell);
+bool validate_message_relaxed_libs(const td::Ref<vm::Cell> &cell);
 
 }  // namespace tlb
 }  // namespace block

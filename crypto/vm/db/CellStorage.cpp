@@ -27,16 +27,26 @@ namespace vm {
 namespace {
 class RefcntCellStorer {
  public:
-  RefcntCellStorer(td::int32 refcnt, const DataCell &cell) : refcnt_(refcnt), cell_(cell) {
+  RefcntCellStorer(td::int32 refcnt, const td::Ref<DataCell> &cell, bool as_boc)
+      : refcnt_(refcnt), cell_(cell), as_boc_(as_boc) {
   }
 
   template <class StorerT>
   void store(StorerT &storer) const {
+    TD_PERF_COUNTER(cell_store);
     using td::store;
+    if (as_boc_) {
+      td::int32 tag = -1;
+      store(tag, storer);
+      store(refcnt_, storer);
+      td::BufferSlice data = vm::std_boc_serialize(cell_).move_as_ok();
+      storer.store_slice(data);
+      return;
+    }
     store(refcnt_, storer);
-    store(cell_, storer);
-    for (unsigned i = 0; i < cell_.size_refs(); i++) {
-      auto cell = cell_.get_ref(i);
+    store(*cell_, storer);
+    for (unsigned i = 0; i < cell_->size_refs(); i++) {
+      auto cell = cell_->get_ref(i);
       auto level_mask = cell->get_level_mask();
       auto level = level_mask.get_level();
       td::uint8 x = static_cast<td::uint8>(level_mask.get_mask());
@@ -60,7 +70,8 @@ class RefcntCellStorer {
 
  private:
   td::int32 refcnt_;
-  const DataCell &cell_;
+  td::Ref<DataCell> cell_;
+  bool as_boc_;
 };
 
 class RefcntCellParser {
@@ -69,11 +80,17 @@ class RefcntCellParser {
   }
   td::int32 refcnt;
   Ref<DataCell> cell;
+  bool stored_boc_;
 
   template <class ParserT>
   void parse(ParserT &parser, ExtCellCreator &ext_cell_creator) {
     using ::td::parse;
     parse(refcnt, parser);
+    stored_boc_ = false;
+    if (refcnt == -1) {
+      stored_boc_ = true;
+      parse(refcnt, parser);
+    }
     if (!need_data_) {
       return;
     }
@@ -81,6 +98,12 @@ class RefcntCellParser {
       TRY_STATUS(parser.get_status());
       auto size = parser.get_left_len();
       td::Slice data = parser.template fetch_string_raw<td::Slice>(size);
+      if (stored_boc_) {
+        TRY_RESULT(boc, vm::std_boc_deserialize(data, false, true));
+        TRY_RESULT(loaded_cell, boc->load_cell());
+        cell = std::move(loaded_cell.data_cell);
+        return td::Status::OK();
+      }
       CellSerializationInfo info;
       auto cell_data = data;
       TRY_STATUS(info.init(cell_data, 0 /*ref_byte_size*/));
@@ -122,12 +145,46 @@ class RefcntCellParser {
 };
 }  // namespace
 
-CellLoader::CellLoader(std::shared_ptr<KeyValueReader> reader) : reader_(std::move(reader)) {
+CellLoader::CellLoader(std::shared_ptr<KeyValueReader> reader, std::function<void(const LoadResult &)> on_load_callback)
+    : reader_(std::move(reader)), on_load_callback_(std::move(on_load_callback)) {
   CHECK(reader_);
 }
 
 td::Result<CellLoader::LoadResult> CellLoader::load(td::Slice hash, bool need_data, ExtCellCreator &ext_cell_creator) {
   //LOG(ERROR) << "Storage: load cell " << hash.size() << " " << td::base64_encode(hash);
+  TD_PERF_COUNTER(cell_load);
+  std::string serialized;
+  TRY_RESULT(get_status, reader_->get(hash, serialized));
+  if (get_status != KeyValue::GetStatus::Ok) {
+    DCHECK(get_status == KeyValue::GetStatus::NotFound);
+    return LoadResult{};
+  }
+  TRY_RESULT(res, load(hash, serialized, need_data, ext_cell_creator));
+  if (on_load_callback_) {
+    on_load_callback_(res);
+  }
+  return res;
+}
+
+td::Result<CellLoader::LoadResult> CellLoader::load(td::Slice hash, td::Slice value, bool need_data,
+                                                    ExtCellCreator &ext_cell_creator) {
+  LoadResult res;
+  res.status = LoadResult::Ok;
+
+  RefcntCellParser refcnt_cell(need_data);
+  td::TlParser parser(value);
+  refcnt_cell.parse(parser, ext_cell_creator);
+  TRY_STATUS(parser.get_status());
+
+  res.refcnt_ = refcnt_cell.refcnt;
+  res.cell_ = std::move(refcnt_cell.cell);
+  res.stored_boc_ = refcnt_cell.stored_boc_;
+  //CHECK(res.cell_->get_hash() == hash);
+
+  return res;
+}
+
+td::Result<CellLoader::LoadResult> CellLoader::load_refcnt(td::Slice hash) {
   LoadResult res;
   std::string serialized;
   TRY_RESULT(get_status, reader_->get(hash, serialized));
@@ -135,18 +192,13 @@ td::Result<CellLoader::LoadResult> CellLoader::load(td::Slice hash, bool need_da
     DCHECK(get_status == KeyValue::GetStatus::NotFound);
     return res;
   }
-
   res.status = LoadResult::Ok;
-
-  RefcntCellParser refcnt_cell(need_data);
   td::TlParser parser(serialized);
-  refcnt_cell.parse(parser, ext_cell_creator);
+  td::parse(res.refcnt_, parser);
+  if (res.refcnt_ == -1) {
+    parse(res.refcnt_, parser);
+  }
   TRY_STATUS(parser.get_status());
-
-  res.refcnt_ = refcnt_cell.refcnt;
-  res.cell_ = std::move(refcnt_cell.cell);
-  //CHECK(res.cell_->get_hash() == hash);
-
   return res;
 }
 
@@ -157,7 +209,11 @@ td::Status CellStorer::erase(td::Slice hash) {
   return kv_.erase(hash);
 }
 
-td::Status CellStorer::set(td::int32 refcnt, const DataCell &cell) {
-  return kv_.set(cell.get_hash().as_slice(), td::serialize(RefcntCellStorer(refcnt, cell)));
+std::string CellStorer::serialize_value(td::int32 refcnt, const td::Ref<DataCell> &cell, bool as_boc) {
+  return td::serialize(RefcntCellStorer(refcnt, cell, as_boc));
+}
+
+td::Status CellStorer::set(td::int32 refcnt, const td::Ref<DataCell> &cell, bool as_boc) {
+  return kv_.set(cell->get_hash().as_slice(), serialize_value(refcnt, cell, as_boc));
 }
 }  // namespace vm

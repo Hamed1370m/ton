@@ -26,6 +26,7 @@
 #include "td/utils/crypto.h"
 
 #include "block/block.h"
+#include "block/mc-config.h"
 
 namespace ton {
 class SmartContract : public td::CntObject {
@@ -48,6 +49,8 @@ class SmartContract : public td::CntObject {
     td::Ref<vm::Cell> actions;
     td::int32 code;
     td::int64 gas_used;
+    td::optional<td::Bits256> missing_library;
+    std::string vm_log;
     static int output_actions_count(td::Ref<vm::Cell> list);
   };
 
@@ -57,9 +60,17 @@ class SmartContract : public td::CntObject {
     td::optional<td::Ref<vm::Tuple>> c7;
     td::optional<td::Ref<vm::Stack>> stack;
     td::optional<td::int32> now;
+    td::optional<td::BitArray<256>> rand_seed;
     bool ignore_chksig{false};
     td::uint64 amount{0};
     td::uint64 balance{0};
+    int vm_log_verbosity_level{0};
+    bool debug_enabled{false};
+
+    td::optional<block::StdAddress> address;
+    td::optional<std::shared_ptr<const block::Config>> config;
+    td::optional<vm::Dictionary> libraries;
+    td::optional<td::Ref<vm::Tuple>> prev_blocks_info;
 
     Args() {
     }
@@ -94,6 +105,10 @@ class SmartContract : public td::CntObject {
       this->stack = std::move(stack);
       return std::move(*this);
     }
+    Args&& set_rand_seed(td::BitArray<256> rand_seed) {
+      this->rand_seed = std::move(rand_seed);
+      return std::move(*this);
+    }
     Args&& set_ignore_chksig(bool ignore_chksig) {
       this->ignore_chksig = ignore_chksig;
       return std::move(*this);
@@ -104,6 +119,34 @@ class SmartContract : public td::CntObject {
     }
     Args&& set_balance(td::uint64 balance) {
       this->balance = balance;
+      return std::move(*this);
+    }
+    Args&& set_address(block::StdAddress address) {
+      this->address = address;
+      return std::move(*this);
+    }
+    Args&& set_config(const std::shared_ptr<const block::Config>& config) {
+      this->config = config;
+      return std::move(*this);
+    }
+    Args&& set_libraries(vm::Dictionary libraries) {
+      this->libraries = libraries;
+      return std::move(*this);
+    }
+    Args&& set_prev_blocks_info(td::Ref<vm::Tuple> tuple) {
+      if (tuple.is_null()) {
+        this->prev_blocks_info = {};
+      } else {
+        this->prev_blocks_info = std::move(tuple);
+      }
+      return std::move(*this);
+    }
+    Args&& set_vm_verbosity_level(int vm_log_verbosity_level) {
+      this->vm_log_verbosity_level = vm_log_verbosity_level;
+      return std::move(*this);
+    }
+    Args&& set_debug_enabled(bool debug_enabled) {
+      this->debug_enabled = debug_enabled;
       return std::move(*this);
     }
 

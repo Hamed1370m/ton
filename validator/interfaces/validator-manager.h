@@ -27,6 +27,9 @@
 #include "message-queue.h"
 #include "validator/validator.h"
 #include "liteserver.h"
+#include "crypto/vm/db/DynamicBagOfCellsDb.h"
+#include "validator-session/validator-session-types.h"
+#include "auto/tl/lite_api.h"
 
 namespace ton {
 
@@ -49,19 +52,31 @@ struct AsyncSerializerState {
   UnixTime last_written_block_ts;
 };
 
+struct CollationStats {
+  td::uint32 bytes, gas, lt_delta;
+  int cat_bytes, cat_gas, cat_lt_delta;
+  std::string limits_log;
+  td::uint32 ext_msgs_total = 0;
+  td::uint32 ext_msgs_filtered = 0;
+  td::uint32 ext_msgs_accepted = 0;
+  td::uint32 ext_msgs_rejected = 0;
+};
+
 using ValidateCandidateResult = td::Variant<UnixTime, CandidateReject>;
 
 class ValidatorManager : public ValidatorManagerInterface {
  public:
+  virtual void init_last_masterchain_state(td::Ref<MasterchainState> state) {
+  }
   virtual void set_block_state(BlockHandle handle, td::Ref<ShardState> state,
                                td::Promise<td::Ref<ShardState>> promise) = 0;
+  virtual void get_cell_db_reader(td::Promise<std::shared_ptr<vm::CellDbReader>> promise) = 0;
   virtual void store_persistent_state_file(BlockIdExt block_id, BlockIdExt masterchain_block_id, td::BufferSlice state,
                                            td::Promise<td::Unit> promise) = 0;
+  virtual void store_persistent_state_file_gen(BlockIdExt block_id, BlockIdExt masterchain_block_id,
+                                               std::function<td::Status(td::FileFd&)> write_data,
+                                               td::Promise<td::Unit> promise) = 0;
   virtual void store_zero_state_file(BlockIdExt block_id, td::BufferSlice state, td::Promise<td::Unit> promise) = 0;
-  virtual void wait_block_state(BlockHandle handle, td::uint32 priority, td::Timestamp timeout,
-                                td::Promise<td::Ref<ShardState>> promise) = 0;
-  virtual void wait_block_state_short(BlockIdExt block_id, td::uint32 priority, td::Timestamp timeout,
-                                      td::Promise<td::Ref<ShardState>> promise) = 0;
 
   virtual void set_block_data(BlockHandle handle, td::Ref<BlockData> data, td::Promise<td::Unit> promise) = 0;
   virtual void wait_block_data(BlockHandle handle, td::uint32 priority, td::Timestamp,
@@ -86,7 +101,10 @@ class ValidatorManager : public ValidatorManagerInterface {
   virtual void wait_block_signatures_short(BlockIdExt id, td::Timestamp timeout,
                                            td::Promise<td::Ref<BlockSignatureSet>> promise) = 0;
 
-  virtual void set_block_candidate(BlockIdExt id, BlockCandidate candidate, td::Promise<td::Unit> promise) = 0;
+  virtual void set_block_candidate(BlockIdExt id, BlockCandidate candidate, CatchainSeqno cc_seqno,
+                                   td::uint32 validator_set_hash, td::Promise<td::Unit> promise) = 0;
+  virtual void send_block_candidate_broadcast(BlockIdExt id, CatchainSeqno cc_seqno, td::uint32 validator_set_hash,
+                                              td::BufferSlice data) = 0;
 
   virtual void wait_block_state_merge(BlockIdExt left_id, BlockIdExt right_id, td::uint32 priority,
                                       td::Timestamp timeout, td::Promise<td::Ref<ShardState>> promise) = 0;
@@ -97,7 +115,8 @@ class ValidatorManager : public ValidatorManagerInterface {
                                         td::Promise<td::Ref<MessageQueue>> promise) = 0;
   virtual void wait_block_message_queue_short(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
                                               td::Promise<td::Ref<MessageQueue>> promise) = 0;
-  virtual void get_external_messages(ShardIdFull shard, td::Promise<std::vector<td::Ref<ExtMessage>>> promise) = 0;
+  virtual void get_external_messages(ShardIdFull shard,
+                                     td::Promise<std::vector<std::pair<td::Ref<ExtMessage>, int>>> promise) = 0;
   virtual void get_ihr_messages(ShardIdFull shard, td::Promise<std::vector<td::Ref<IhrMessage>>> promise) = 0;
   virtual void get_shard_blocks(BlockIdExt masterchain_block_id,
                                 td::Promise<std::vector<td::Ref<ShardTopBlockDescription>>> promise) = 0;
@@ -125,11 +144,16 @@ class ValidatorManager : public ValidatorManagerInterface {
   virtual void send_external_message(td::Ref<ExtMessage> message) = 0;
   virtual void send_ihr_message(td::Ref<IhrMessage> message) = 0;
   virtual void send_top_shard_block_description(td::Ref<ShardTopBlockDescription> desc) = 0;
-  virtual void send_block_broadcast(BlockBroadcast broadcast) = 0;
+  virtual void send_block_broadcast(BlockBroadcast broadcast, int mode) = 0;
+  virtual void send_validator_telemetry(PublicKeyHash key, tl_object_ptr<ton_api::validator_telemetry> telemetry) = 0;
+  virtual void send_get_out_msg_queue_proof_request(ShardIdFull dst_shard, std::vector<BlockIdExt> blocks,
+                                                    block::ImportedMsgQueueLimits limits,
+                                                    td::Promise<std::vector<td::Ref<OutMsgQueueProof>>> promise) = 0;
+  virtual void send_download_archive_request(BlockSeqno mc_seqno, ShardIdFull shard_prefix, std::string tmp_dir,
+                                             td::Timestamp timeout, td::Promise<std::string> promise) = 0;
 
   virtual void update_shard_client_state(BlockIdExt masterchain_block_id, td::Promise<td::Unit> promise) = 0;
   virtual void get_shard_client_state(bool from_db, td::Promise<BlockIdExt> promise) = 0;
-  virtual void subscribe_to_shard(ShardIdFull shard) = 0;
 
   virtual void update_async_serializer_state(AsyncSerializerState state, td::Promise<td::Unit> promise) = 0;
   virtual void get_async_serializer_state(td::Promise<AsyncSerializerState> promise) = 0;
@@ -155,11 +179,42 @@ class ValidatorManager : public ValidatorManagerInterface {
   virtual void update_last_known_key_block(BlockHandle handle, bool send_request) = 0;
   virtual void update_gc_block_handle(BlockHandle handle, td::Promise<td::Unit> promise) = 0;
 
-  virtual void update_shard_client_block_handle(BlockHandle handle, td::Promise<td::Unit> promise) = 0;
+  virtual void update_shard_client_block_handle(BlockHandle handle, td::Ref<MasterchainState> state,
+                                                td::Promise<td::Unit> promise) = 0;
 
   virtual void truncate(BlockSeqno seqno, ConstBlockHandle handle, td::Promise<td::Unit> promise) = 0;
 
   virtual void wait_shard_client_state(BlockSeqno seqno, td::Timestamp timeout, td::Promise<td::Unit> promise) = 0;
+
+  virtual void log_validator_session_stats(BlockIdExt block_id, validatorsession::ValidatorSessionStats stats) = 0;
+  virtual void log_new_validator_group_stats(validatorsession::NewValidatorGroupStats stats) = 0;
+  virtual void log_end_validator_group_stats(validatorsession::EndValidatorGroupStats stats) = 0;
+
+  virtual void get_block_handle_for_litequery(BlockIdExt block_id, td::Promise<ConstBlockHandle> promise) = 0;
+  virtual void get_block_data_for_litequery(BlockIdExt block_id, td::Promise<td::Ref<BlockData>> promise) = 0;
+  virtual void get_block_state_for_litequery(BlockIdExt block_id, td::Promise<td::Ref<ShardState>> promise) = 0;
+  virtual void get_block_by_lt_for_litequery(AccountIdPrefixFull account, LogicalTime lt,
+                                             td::Promise<ConstBlockHandle> promise) = 0;
+  virtual void get_block_by_unix_time_for_litequery(AccountIdPrefixFull account, UnixTime ts,
+                                                    td::Promise<ConstBlockHandle> promise) = 0;
+  virtual void get_block_by_seqno_for_litequery(AccountIdPrefixFull account, BlockSeqno seqno,
+                                                td::Promise<ConstBlockHandle> promise) = 0;
+  virtual void get_block_candidate_for_litequery(PublicKey source, BlockIdExt block_id, FileHash collated_data_hash,
+                                                 td::Promise<BlockCandidate> promise) = 0;
+  virtual void get_validator_groups_info_for_litequery(
+      td::optional<ShardIdFull> shard,
+      td::Promise<tl_object_ptr<lite_api::liteServer_nonfinal_validatorGroups>> promise) = 0;
+
+  virtual void add_lite_query_stats(int lite_query_id) {
+  }
+
+  virtual void record_collate_query_stats(BlockIdExt block_id, double work_time, double cpu_work_time,
+                                          CollationStats stats) {
+  }
+  virtual void record_validate_query_stats(BlockIdExt block_id, double work_time, double cpu_work_time) {
+  }
+
+  virtual void add_persistent_state_description(td::Ref<PersistentStateDescription> desc) = 0;
 
   static bool is_persistent_state(UnixTime ts, UnixTime prev_ts) {
     return ts / (1 << 17) != prev_ts / (1 << 17);

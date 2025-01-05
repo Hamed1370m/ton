@@ -19,7 +19,7 @@
 #pragma once
 
 #include "td/utils/Slice.h"
-
+#include "td/utils/HashSet.h"
 #include <set>
 
 namespace vm {
@@ -43,7 +43,7 @@ class CellHashTable {
   template <class F>
   void for_each(F &&f) {
     for (auto &info : set_) {
-      f(info);
+      f(const_cast<InfoT &>(info));
     }
   }
   template <class F>
@@ -64,8 +64,15 @@ class CellHashTable {
   size_t size() const {
     return set_.size();
   }
+  InfoT* get_if_exists(td::Slice hash) {
+    auto it = set_.find(hash);
+    if (it != set_.end()) {
+      return &const_cast<InfoT &>(*it);
+    }
+    return nullptr;
+  }
 
  private:
-  std::set<InfoT, std::less<>> set_;
+  td::NodeHashSet<InfoT, typename InfoT::Hash, typename InfoT::Eq> set_;
 };
 }  // namespace vm

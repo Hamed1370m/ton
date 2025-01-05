@@ -159,7 +159,6 @@ std::string CppIdentSet::compute_cpp_ident(std::string orig_ident, int count) {
   }
   if (!cnt) {
     os << '_';
-    prev_skip = true;
   }
   if (count) {
     os << count;
@@ -1317,7 +1316,7 @@ void CppTypeCode::clear_context() {
 std::string CppTypeCode::new_tmp_var() {
   char buffer[16];
   while (true) {
-    sprintf(buffer, "t%d", ++tmp_ints);
+    snprintf(buffer, sizeof(buffer), "t%d", ++tmp_ints);
     if (tmp_cpp_ids.is_good_ident(buffer) && local_cpp_ids.is_good_ident(buffer)) {
       break;
     }

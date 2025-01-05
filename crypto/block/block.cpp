@@ -28,6 +28,7 @@
 #include "td/utils/tl_storers.h"
 #include "td/utils/misc.h"
 #include "td/utils/Random.h"
+#include "vm/fmt.hpp"
 
 namespace block {
 using namespace std::literals::string_literals;
@@ -642,7 +643,11 @@ bool EnqueuedMsgDescr::unpack(vm::CellSlice& cs) {
   }
   cur_prefix_ = interpolate_addr(src_prefix_, dest_prefix_, env.cur_addr);
   next_prefix_ = interpolate_addr(src_prefix_, dest_prefix_, env.next_addr);
-  lt_ = info.created_lt;
+  unsigned long long lt;
+  if (!tlb::t_MsgEnvelope.get_emitted_lt(vm::load_cell_slice(enq.out_msg), lt)) {
+    return invalidate();
+  }
+  lt_ = lt;
   enqueued_lt_ = enq.enqueued_lt;
   hash_ = env.msg->get_hash().bits();
   msg_ = std::move(env.msg);
@@ -653,6 +658,12 @@ bool EnqueuedMsgDescr::unpack(vm::CellSlice& cs) {
 bool EnqueuedMsgDescr::check_key(td::ConstBitPtr key) const {
   return key.get_int(32) == next_prefix_.workchain && (key + 32).get_uint(64) == next_prefix_.account_id_prefix &&
          hash_ == key + 96;
+}
+
+bool ImportedMsgQueueLimits::deserialize(vm::CellSlice& cs) {
+  return cs.fetch_ulong(8) == 0xd3           // imported_msg_queue_limits#d3
+         && cs.fetch_uint_to(32, max_bytes)  // max_bytes:#
+         && cs.fetch_uint_to(32, max_msgs);  // max_msgs:#
 }
 
 bool ParamLimits::deserialize(vm::CellSlice& cs) {
@@ -714,8 +725,8 @@ td::uint64 BlockLimitStatus::estimate_block_size(const vm::NewCellStorageStat::S
   if (extra) {
     sum += *extra;
   }
-  return 2000 + (sum.bits >> 3) + sum.cells * 12 + sum.internal_refs * 3 + sum.external_refs * 40 + accounts * 200 +
-         transactions * 200 + (extra ? 200 : 0);
+  return 2000 + (sum.bits >> 3) + sum.cells * 12 + sum.internal_refs * 3 + sum.external_refs * 40 + transactions * 200 +
+         (extra ? 200 : 0) + extra_out_msgs * 300 + public_library_diff * 700;
 }
 
 int BlockLimitStatus::classify() const {
@@ -858,12 +869,20 @@ td::Status ShardState::unpack_out_msg_queue_info(Ref<vm::Cell> out_msg_queue_inf
     return td::Status::Error(
         -666, "ProcessedInfo in the state of "s + id_.to_str() + " is invalid according to automated validity checks");
   }
-  if (!block::gen::t_IhrPendingInfo.validate_csr(1024, qinfo.ihr_pending)) {
-    return td::Status::Error(
-        -666, "IhrPendingInfo in the state of "s + id_.to_str() + " is invalid according to automated validity checks");
-  }
   processed_upto_ = block::MsgProcessedUptoCollection::unpack(ton::ShardIdFull(id_), std::move(qinfo.proc_info));
-  ihr_pending_ = std::make_unique<vm::Dictionary>(std::move(qinfo.ihr_pending), 320);
+  ihr_pending_ = std::make_unique<vm::Dictionary>(320);
+  if (qinfo.extra.write().fetch_long(1)) {
+    block::gen::OutMsgQueueExtra::Record extra;
+    if (!block::tlb::csr_unpack(qinfo.extra, extra)) {
+      return td::Status::Error(-666, "cannot unpack OutMsgQueueExtre in the state of "s + id_.to_str());
+    }
+    dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(extra.dispatch_queue, 256, tlb::aug_DispatchQueue);
+    if (extra.out_queue_size.write().fetch_long(1)) {
+      out_msg_queue_size_ = extra.out_queue_size->prefetch_ulong(48);
+    }
+  } else {
+    dispatch_queue_ = std::make_unique<vm::AugmentedDictionary>(256, tlb::aug_DispatchQueue);
+  }
   auto shard1 = id_.shard_full();
   td::BitArray<64> pfx{(long long)shard1.shard};
   int pfx_len = shard_prefix_length(shard1);
@@ -994,6 +1013,17 @@ td::Status ShardState::merge_with(ShardState& sib) {
   underload_history_ = overload_history_ = 0;
   // 10. compute vert_seqno
   vert_seqno_ = std::max(vert_seqno_, sib.vert_seqno_);
+  // 11. merge dispatch_queue (same as account dict)
+  if (!dispatch_queue_->combine_with(*sib.dispatch_queue_)) {
+    return td::Status::Error(-666, "cannot merge dispatch queues of the two ancestors");
+  }
+  sib.dispatch_queue_.reset();
+  // 11. merge out_msg_queue_size
+  if (out_msg_queue_size_ && sib.out_msg_queue_size_) {
+    out_msg_queue_size_.value() += sib.out_msg_queue_size_.value();
+  } else {
+    out_msg_queue_size_ = {};
+  }
   // Anything else? add here
   // ...
 
@@ -1058,10 +1088,12 @@ td::Status ShardState::split(ton::ShardIdFull subshard) {
   auto shard1 = id_.shard_full();
   CHECK(ton::shard_is_parent(shard1, subshard));
   CHECK(out_msg_queue_);
-  int res1 = block::filter_out_msg_queue(*out_msg_queue_, shard1, subshard);
+  td::uint64 queue_size;
+  int res1 = block::filter_out_msg_queue(*out_msg_queue_, shard1, subshard, &queue_size);
   if (res1 < 0) {
     return td::Status::Error(-666, "error splitting OutMsgQueue of "s + id_.to_str());
   }
+  out_msg_queue_size_ = queue_size;
   LOG(DEBUG) << "split counters: " << res1;
   // 3. processed_upto
   LOG(DEBUG) << "splitting ProcessedUpto";
@@ -1091,6 +1123,11 @@ td::Status ShardState::split(ton::ShardIdFull subshard) {
   // NB: if total_fees_extra will be allowed to be non-empty, split it here too
   // 7. reset overload/underload history
   overload_history_ = underload_history_ = 0;
+  // 8. split dispatch_queue (same as account dict)
+  LOG(DEBUG) << "splitting dispatch_queue";
+  CHECK(dispatch_queue_);
+  CHECK(dispatch_queue_->cut_prefix_subdict(pfx.bits(), pfx_len));
+  CHECK(dispatch_queue_->has_common_prefix(pfx.bits(), pfx_len));
   // 999. anything else?
   id_.id.shard = subshard.shard;
   id_.file_hash.set_zero();
@@ -1098,8 +1135,12 @@ td::Status ShardState::split(ton::ShardIdFull subshard) {
   return td::Status::OK();
 }
 
-int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull old_shard, ton::ShardIdFull subshard) {
-  return out_queue.filter([subshard, old_shard](vm::CellSlice& cs, td::ConstBitPtr key, int key_len) -> int {
+int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull old_shard, ton::ShardIdFull subshard,
+                         td::uint64* queue_size) {
+  if (queue_size) {
+    *queue_size = 0;
+  }
+  return out_queue.filter([=](vm::CellSlice& cs, td::ConstBitPtr key, int key_len) -> int {
     CHECK(key_len == 352);
     LOG(DEBUG) << "scanning OutMsgQueue entry with key " << key.to_hex(key_len);
     block::tlb::MsgEnvelope::Record_std env;
@@ -1122,7 +1163,11 @@ int filter_out_msg_queue(vm::AugmentedDictionary& out_queue, ton::ShardIdFull ol
                  << " does not contain current address belonging to shard " << old_shard.to_str();
       return -1;
     }
-    return ton::shard_contains(subshard, cur_prefix);
+    bool res = ton::shard_contains(subshard, cur_prefix);
+    if (res && queue_size) {
+      ++*queue_size;
+    }
+    return res;
   });
 }
 
@@ -1364,42 +1409,60 @@ std::ostream& operator<<(std::ostream& os, const CurrencyCollection& cc) {
 bool ValueFlow::set_zero() {
   return from_prev_blk.set_zero() && to_next_blk.set_zero() && imported.set_zero() && exported.set_zero() &&
          fees_collected.set_zero() && fees_imported.set_zero() && recovered.set_zero() && created.set_zero() &&
-         minted.set_zero();
+         minted.set_zero() && burned.set_zero();
 }
 
 bool ValueFlow::validate() const {
   return is_valid() && from_prev_blk + imported + fees_imported + created + minted + recovered ==
-                           to_next_blk + exported + fees_collected;
+                           to_next_blk + exported + fees_collected + burned;
 }
 
 bool ValueFlow::store(vm::CellBuilder& cb) const {
   vm::CellBuilder cb2;
-  return cb.store_long_bool(block::gen::ValueFlow::cons_tag[0], 32)  // value_flow ^[
-         && from_prev_blk.store(cb2)                                 //   from_prev_blk:CurrencyCollection
-         && to_next_blk.store(cb2)                                   //   to_next_blk:CurrencyCollection
-         && imported.store(cb2)                                      //   imported:CurrencyCollection
-         && exported.store(cb2)                                      //   exported:CurrencyCollection
-         && cb.store_ref_bool(cb2.finalize())                        // ]
-         && fees_collected.store(cb)                                 // fees_collected:CurrencyCollection
-         && fees_imported.store(cb2)                                 // ^[ fees_imported:CurrencyCollection
-         && recovered.store(cb2)                                     //    recovered:CurrencyCollection
-         && created.store(cb2)                                       //    created:CurrencyCollection
-         && minted.store(cb2)                                        //    minted:CurrencyCollection
-         && cb.store_ref_bool(cb2.finalize());                       // ] = ValueFlow;
+  auto type = burned.is_zero() ? block::gen::ValueFlow::value_flow : block::gen::ValueFlow::value_flow_v2;
+  return cb.store_long_bool(block::gen::ValueFlow::cons_tag[type], 32)  // ^[
+         && from_prev_blk.store(cb2)                                    //   from_prev_blk:CurrencyCollection
+         && to_next_blk.store(cb2)                                      //   to_next_blk:CurrencyCollection
+         && imported.store(cb2)                                         //   imported:CurrencyCollection
+         && exported.store(cb2)                                         //   exported:CurrencyCollection
+         && cb.store_ref_bool(cb2.finalize())                           // ]
+         && fees_collected.store(cb)                                    // fees_collected:CurrencyCollection
+         && (burned.is_zero() || burned.store(cb))                      // fees_burned:CurrencyCollection
+         && fees_imported.store(cb2)                                    // ^[ fees_imported:CurrencyCollection
+         && recovered.store(cb2)                                        //    recovered:CurrencyCollection
+         && created.store(cb2)                                          //    created:CurrencyCollection
+         && minted.store(cb2)                                           //    minted:CurrencyCollection
+         && cb.store_ref_bool(cb2.finalize());                          // ] = ValueFlow;
 }
 
 bool ValueFlow::fetch(vm::CellSlice& cs) {
-  block::gen::ValueFlow::Record f;
-  if (!(tlb::unpack(cs, f) && from_prev_blk.validate_unpack(std::move(f.r1.from_prev_blk)) &&
-        to_next_blk.validate_unpack(std::move(f.r1.to_next_blk)) &&
-        imported.validate_unpack(std::move(f.r1.imported)) && exported.validate_unpack(std::move(f.r1.exported)) &&
-        fees_collected.validate_unpack(std::move(f.fees_collected)) &&
-        fees_imported.validate_unpack(std::move(f.r2.fees_imported)) &&
-        recovered.validate_unpack(std::move(f.r2.recovered)) && created.validate_unpack(std::move(f.r2.created)) &&
-        minted.validate_unpack(std::move(f.r2.minted)))) {
+  if (cs.size() < 32) {
     return invalidate();
   }
-  return true;
+  auto tag = cs.prefetch_ulong(32);
+  block::gen::ValueFlow::Record_value_flow f1;
+  if (tag == block::gen::ValueFlow::cons_tag[block::gen::ValueFlow::value_flow] && tlb::unpack(cs, f1) &&
+      from_prev_blk.validate_unpack(std::move(f1.r1.from_prev_blk)) &&
+      to_next_blk.validate_unpack(std::move(f1.r1.to_next_blk)) &&
+      imported.validate_unpack(std::move(f1.r1.imported)) && exported.validate_unpack(std::move(f1.r1.exported)) &&
+      fees_collected.validate_unpack(std::move(f1.fees_collected)) && burned.set_zero() &&
+      fees_imported.validate_unpack(std::move(f1.r2.fees_imported)) &&
+      recovered.validate_unpack(std::move(f1.r2.recovered)) && created.validate_unpack(std::move(f1.r2.created)) &&
+      minted.validate_unpack(std::move(f1.r2.minted))) {
+    return true;
+  }
+  block::gen::ValueFlow::Record_value_flow_v2 f2;
+  if (tag == block::gen::ValueFlow::cons_tag[block::gen::ValueFlow::value_flow_v2] && tlb::unpack(cs, f2) &&
+      from_prev_blk.validate_unpack(std::move(f2.r1.from_prev_blk)) &&
+      to_next_blk.validate_unpack(std::move(f2.r1.to_next_blk)) &&
+      imported.validate_unpack(std::move(f2.r1.imported)) && exported.validate_unpack(std::move(f2.r1.exported)) &&
+      fees_collected.validate_unpack(std::move(f2.fees_collected)) && burned.validate_unpack(std::move(f2.burned)) &&
+      fees_imported.validate_unpack(std::move(f2.r2.fees_imported)) &&
+      recovered.validate_unpack(std::move(f2.r2.recovered)) && created.validate_unpack(std::move(f2.r2.created)) &&
+      minted.validate_unpack(std::move(f2.r2.minted))) {
+    return true;
+  }
+  return invalidate();
 }
 
 bool ValueFlow::unpack(Ref<vm::CellSlice> csr) {
@@ -1424,7 +1487,8 @@ bool ValueFlow::show(std::ostream& os) const {
           show_one(os, " to_next_blk:", to_next_blk) && show_one(os, " imported:", imported) &&
           show_one(os, " exported:", exported) && show_one(os, " fees_collected:", fees_collected) &&
           show_one(os, " fees_imported:", fees_imported) && show_one(os, " recovered:", recovered) &&
-          show_one(os, " created:", created) && show_one(os, " minted:", minted) && say(os, ")")) ||
+          show_one(os, " created:", created) && show_one(os, " minted:", minted) &&
+          (burned.is_zero() || show_one(os, " burned:", burned)) && say(os, ")")) ||
          (say(os, "...<invalid-value-flow>)") && false);
 }
 
@@ -2276,5 +2340,133 @@ bool parse_block_id_ext(const char* str, const char* end, ton::BlockIdExt& blkid
 bool parse_block_id_ext(td::Slice str, ton::BlockIdExt& blkid) {
   return parse_block_id_ext(str.begin(), str.end(), blkid);
 }
+
+bool unpack_account_dispatch_queue(Ref<vm::CellSlice> csr, vm::Dictionary& dict, td::uint64& dict_size) {
+  if (csr.not_null()) {
+    block::gen::AccountDispatchQueue::Record rec;
+    if (!block::tlb::csr_unpack(std::move(csr), rec)) {
+      return false;
+    }
+    dict = vm::Dictionary{rec.messages, 64};
+    dict_size = rec.count;
+    if (dict_size == 0 || dict.is_empty()) {
+      return false;
+    }
+  } else {
+    dict = vm::Dictionary{64};
+    dict_size = 0;
+  }
+  return true;
+}
+
+Ref<vm::CellSlice> pack_account_dispatch_queue(const vm::Dictionary& dict, td::uint64 dict_size) {
+  if (dict_size == 0) {
+    return {};
+  }
+  // _ messages:(HashmapE 64 EnqueuedMsg) count:uint48 = AccountDispatchQueue;
+  vm::CellBuilder cb;
+  CHECK(dict.append_dict_to_bool(cb));
+  cb.store_long(dict_size, 48);
+  return cb.as_cellslice_ref();
+}
+
+Ref<vm::CellSlice> get_dispatch_queue_min_lt_account(const vm::AugmentedDictionary& dispatch_queue,
+                                                     ton::StdSmcAddress& addr) {
+  // TODO: This can be done more effectively
+  vm::AugmentedDictionary queue{dispatch_queue.get_root(), 256, tlb::aug_DispatchQueue};
+  if (queue.is_empty()) {
+    return {};
+  }
+  auto root_extra = queue.get_root_extra();
+  if (root_extra.is_null()) {
+    return {};
+  }
+  ton::LogicalTime min_lt = root_extra->prefetch_long(64);
+  while (true) {
+    td::Bits256 key;
+    int pfx_len = queue.get_common_prefix(key.bits(), 256);
+    if (pfx_len < 0) {
+      return {};
+    }
+    if (pfx_len == 256) {
+      addr = key;
+      return queue.lookup(key);
+    }
+    key[pfx_len] = false;
+    vm::AugmentedDictionary queue_cut{queue.get_root(), 256, tlb::aug_DispatchQueue};
+    if (!queue_cut.cut_prefix_subdict(key.bits(), pfx_len + 1)) {
+      return {};
+    }
+    root_extra = queue_cut.get_root_extra();
+    if (root_extra.is_null()) {
+      return {};
+    }
+    ton::LogicalTime cut_min_lt = root_extra->prefetch_long(64);
+    if (cut_min_lt != min_lt) {
+      key[pfx_len] = true;
+    }
+    if (!queue.cut_prefix_subdict(key.bits(), pfx_len + 1)) {
+      return {};
+    }
+  }
+}
+
+bool remove_dispatch_queue_entry(vm::AugmentedDictionary& dispatch_queue, const ton::StdSmcAddress& addr,
+                                 ton::LogicalTime lt) {
+  auto account_dispatch_queue = dispatch_queue.lookup(addr);
+  if (account_dispatch_queue.is_null()) {
+    return false;
+  }
+  vm::Dictionary dict{64};
+  td::uint64 dict_size;
+  if (!unpack_account_dispatch_queue(std::move(account_dispatch_queue), dict, dict_size)) {
+    return false;
+  }
+  td::BitArray<64> key;
+  key.store_ulong(lt);
+  auto entry = dict.lookup_delete(key);
+  if (entry.is_null()) {
+    return false;
+  }
+  --dict_size;
+  account_dispatch_queue = pack_account_dispatch_queue(dict, dict_size);
+  if (account_dispatch_queue.not_null()) {
+    dispatch_queue.set(addr, account_dispatch_queue);
+  } else {
+    dispatch_queue.lookup_delete(addr);
+  }
+  return true;
+}
+
+bool MsgMetadata::unpack(vm::CellSlice& cs) {
+  // msg_metadata#0 depth:uint32 initiator_addr:MsgAddressInt initiator_lt:uint64 = MsgMetadata;
+  int tag;
+  return cs.fetch_int_to(4, tag) && tag == 0 && cs.fetch_uint_to(32, depth) &&
+         cs.prefetch_ulong(3) == 0b100 &&  // std address, no anycast
+         tlb::t_MsgAddressInt.extract_std_address(cs, initiator_wc, initiator_addr) &&
+         cs.fetch_uint_to(64, initiator_lt);
+}
+
+bool MsgMetadata::pack(vm::CellBuilder& cb) const {
+  // msg_metadata#0 depth:uint32 initiator_addr:MsgAddressInt initiator_lt:uint64 = MsgMetadata;
+  return cb.store_long_bool(0, 4) && cb.store_long_bool(depth, 32) &&
+         tlb::t_MsgAddressInt.store_std_address(cb, initiator_wc, initiator_addr) &&
+         cb.store_long_bool(initiator_lt, 64);
+}
+
+std::string MsgMetadata::to_str() const {
+  return PSTRING() << "[ depth=" << depth << " init=" << initiator_wc << ":" << initiator_addr.to_hex() << ":"
+                   << initiator_lt << " ]";
+}
+
+bool MsgMetadata::operator==(const MsgMetadata& other) const {
+  return depth == other.depth && initiator_wc == other.initiator_wc && initiator_addr == other.initiator_addr &&
+         initiator_lt == other.initiator_lt;
+}
+
+bool MsgMetadata::operator!=(const MsgMetadata& other) const {
+  return !(*this == other);
+}
+
 
 }  // namespace block

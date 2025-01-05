@@ -18,9 +18,11 @@
 */
 #pragma once
 
+#include "interfaces/validator-manager.h"
 #include "validator/interfaces/external-message.h"
 #include "auto/tl/ton_api.h"
 #include "adnl/utils.hpp"
+#include "block/transaction.h"
 
 namespace ton {
 
@@ -31,10 +33,10 @@ class ExtMessageQ : public ExtMessage {
   AccountIdPrefixFull addr_prefix_;
   td::BufferSlice data_;
   Hash hash_;
+  ton::WorkchainId wc_;
+  ton::StdSmcAddress addr_;
 
  public:
-  static constexpr unsigned max_ext_msg_size = 65535;
-  static constexpr unsigned max_ext_msg_depth = 512;
   AccountIdPrefixFull shard() const override {
     return addr_prefix_;
   }
@@ -47,8 +49,25 @@ class ExtMessageQ : public ExtMessage {
   Hash hash() const override {
     return hash_;
   }
-  ExtMessageQ(td::BufferSlice data, td::Ref<vm::Cell> root, AccountIdPrefixFull shard);
-  static td::Result<td::Ref<ExtMessageQ>> create_ext_message(td::BufferSlice data);
+  ton::WorkchainId wc() const override {
+    return wc_;
+  }
+
+  ton::StdSmcAddress addr() const override {
+    return addr_;
+  }
+
+  ExtMessageQ(td::BufferSlice data, td::Ref<vm::Cell> root, AccountIdPrefixFull shard, ton::WorkchainId wc,
+              ton::StdSmcAddress addr);
+  static td::Result<td::Ref<ExtMessageQ>> create_ext_message(td::BufferSlice data,
+                                                             block::SizeLimitsConfig::ExtMsgLimits limits);
+  static void run_message(td::Ref<ExtMessage> message, td::actor::ActorId<ton::validator::ValidatorManager> manager,
+                          td::Promise<td::Ref<ExtMessage>> promise);
+  static td::Status run_message_on_account(ton::WorkchainId wc,
+                                           block::Account* acc,
+                                           UnixTime utime, LogicalTime lt,
+                                           td::Ref<vm::Cell> msg_root,
+                                           std::unique_ptr<block::ConfigInfo> config);
 };
 
 }  // namespace validator

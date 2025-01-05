@@ -68,6 +68,7 @@ adnl.address.udp6 ip:int128 port:int = adnl.Address;
 //adnl.address.tcp6 ip:int128 port:int = adnl.Address;
 
 adnl.address.tunnel to:int256 pubkey:PublicKey = adnl.Address; 
+adnl.address.reverse = adnl.Address;
 
 adnl.addressList addrs:(vector adnl.Address) version:int reinit_date:int priority:int expire_at:int = adnl.AddressList;
 
@@ -143,7 +144,26 @@ adnl.message.part hash:int256 total_size:int offset:int data:bytes = adnl.Messag
 ---types---
 
 adnl.db.node.key local_id:int256 peer_id:int256 = adnl.db.Key;
-adnl.db.node.value date:int id:PublicKey addr_list:adnl.addressList priority_addr_list:adnl.addressList = adnl.db.node.Value; 
+adnl.db.node.value date:int id:PublicKey addr_list:adnl.addressList priority_addr_list:adnl.addressList = adnl.db.node.Value;
+
+adnl.stats.packets ts_start:double ts_end:double
+    in_packets:long in_bytes:long in_packets_channel:long in_bytes_channel:long
+    out_packets:long out_bytes:long out_packets_channel:long out_bytes_channel:long
+    out_expired_messages:long out_expired_bytes:long = adnl.stats.Packets;
+adnl.stats.peerPair local_id:int256 peer_id:int256 ip_str:string
+    packets_recent:adnl.stats.packets packets_total:adnl.stats.packets
+    last_out_packet_ts:double last_in_packet_ts:double
+    connection_ready:Bool channel_status:int try_reinit_at:double
+    out_queue_messages:long out_queue_bytes:long
+    = adnl.stats.PeerPair;
+adnl.stats.ipPackets ip_str:string packets:long = adnl.stats.IpPackets;
+adnl.stats.localIdPackets ts_start:double ts_end:double
+    decrypted_packets:(vector adnl.stats.ipPackets) dropped_packets:(vector adnl.stats.ipPackets) = adnl.stats.LocalIdPackets;
+adnl.stats.localId short_id:int256
+    current_decrypt:(vector adnl.stats.ipPackets)
+    packets_recent:adnl.stats.localIdPackets packets_total:adnl.stats.localIdPackets
+    peers:(vector adnl.stats.peerPair) = adnl.stats.LocalId;
+adnl.stats timestamp:double local_ids:(vector adnl.stats.localId) = adnl.Stats;
 
 ---functions---
 
@@ -183,8 +203,12 @@ dht.pong random_id:long = dht.Pong;
 dht.valueNotFound nodes:dht.nodes = dht.ValueResult;
 dht.valueFound value:dht.Value = dht.ValueResult;
 
+dht.clientNotFound nodes:dht.nodes = dht.ReversePingResult;
+dht.reversePingOk = dht.ReversePingResult;
+
 dht.stored = dht.Stored;
 dht.message node:dht.node = dht.Message;
+dht.requestReversePingCont target:adnl.Node signature:bytes client:int256 = dht.RequestReversePingCont;
 
 dht.db.bucket nodes:dht.nodes = dht.db.Bucket;
 dht.db.key.bucket id:int = dht.db.Key;
@@ -196,16 +220,23 @@ dht.store value:dht.value = dht.Stored;
 dht.findNode key:int256 k:int = dht.Nodes; 
 dht.findValue key:int256 k:int = dht.ValueResult; 
 dht.getSignedAddressList = dht.Node;
+dht.registerReverseConnection node:PublicKey ttl:int signature:bytes = dht.Stored;
+dht.requestReversePing target:adnl.Node signature:bytes client:int256 k:int = dht.ReversePingResult;
 
 dht.query node:dht.node = True;
 
 ---types---
 
 overlay.node.toSign id:adnl.id.short overlay:int256 version:int = overlay.node.ToSign;
+overlay.node.toSignEx id:adnl.id.short overlay:int256 flags:int version:int = overlay.node.ToSign;
 overlay.node id:PublicKey overlay:int256 version:int signature:bytes = overlay.Node;
+overlay.nodeV2 id:PublicKey overlay:int256 flags:int version:int signature:bytes certificate:overlay.MemberCertificate = overlay.NodeV2;
 overlay.nodes nodes:(vector overlay.node) = overlay.Nodes;
+overlay.nodesV2 nodes:(vector overlay.NodeV2) = overlay.NodesV2;
 
+overlay.messageExtra flags:# certificate:flags.0?overlay.MemberCertificate = overlay.MessageExtra;
 overlay.message overlay:int256 = overlay.Message;
+overlay.messageWithExtra overlay:int256 extra:overlay.messageExtra = overlay.Message;
 //overlay.randomPeers peers:(vector adnl.node) = overlay.RandomPeers;
 overlay.broadcastList hashes:(vector int256) = overlay.BroadcastList;
 
@@ -218,10 +249,15 @@ overlay.broadcastFec.partId broadcast_hash:int256 data_hash:int256 seqno:int = o
 
 overlay.broadcast.toSign hash:int256 date:int = overlay.broadcast.ToSign;
 
+overlay.memberCertificateId node:adnl.id.short flags:int slot:int expire_at:int = overlay.MemberCertificateId;
+overlay.memberCertificate issued_by:PublicKey flags:int slot:int expire_at:int signature:bytes = overlay.MemberCertificate;
+overlay.emptyMemberCertificate = overlay.MemberCertificate;
 overlay.certificate issued_by:PublicKey expire_at:int max_size:int signature:bytes = overlay.Certificate;
+overlay.certificateV2 issued_by:PublicKey expire_at:int max_size:int flags:int signature:bytes = overlay.Certificate;
 overlay.emptyCertificate = overlay.Certificate;
 
 overlay.certificateId overlay_id:int256 node:int256 expire_at:int max_size:int = overlay.CertificateId;
+overlay.certificateIdV2 overlay_id:int256 node:int256 expire_at:int max_size:int flags:int = overlay.CertificateId;
 
 overlay.unicast data:bytes = overlay.Broadcast;
 overlay.broadcast src:PublicKey certificate:overlay.Certificate flags:int data:bytes date:int signature:bytes = overlay.Broadcast;
@@ -233,13 +269,16 @@ overlay.broadcastNotFound = overlay.Broadcast;
 ---functions---
 
 overlay.getRandomPeers peers:overlay.nodes = overlay.Nodes;
+overlay.getRandomPeersV2 peers:overlay.NodesV2 = overlay.NodesV2;
 
 overlay.query overlay:int256 = True;
+overlay.queryWithExtra overlay:int256 extra:overlay.messageExtra = True;
 overlay.getBroadcast hash:int256 = overlay.Broadcast;
 overlay.getBroadcastList list:overlay.broadcastList = overlay.BroadcastList;
 
 ---types---
 
+overlay.db.nodesV2 nodes:overlay.nodesV2 = overlay.db.Nodes;
 overlay.db.nodes nodes:overlay.nodes = overlay.db.Nodes;
 overlay.db.key.nodes local_id:int256 overlay:int256 = overlay.db.Key;
 
@@ -257,7 +296,7 @@ catchain.blockUpdate block:catchain.block = catchain.Update;
 catchain.block.data.badBlock block:catchain.block = catchain.block.inner.Data;
 catchain.block.data.fork left:catchain.block.Dep right:catchain.block.Dep = catchain.block.inner.Data;
 catchain.block.data.nop = catchain.block.inner.Data;
-catchain.block.data.vector msgs:(vector bytes) = catchain.block.inner.Data;
+//catchain.block.data.vector msgs:(vector bytes) = catchain.block.inner.Data;
 //catchain.block.data.custom = catchain.block.inner.Data;
 
 catchain.firstblock unique_hash:int256 nodes:(vector int256) = catchain.FirstBlock;
@@ -268,14 +307,10 @@ catchain.differenceFork left:catchain.block.dep right:catchain.block.dep = catch
 catchain.blockNotFound = catchain.BlockResult;
 catchain.blockResult block:catchain.block = catchain.BlockResult;
 
-catchain.sent cnt:int = catchain.Sent;
-
 ---functions---
 
 catchain.getBlock block:int256 = catchain.BlockResult;
-catchain.getBlocks blocks:(vector int256) = catchain.Sent;
 catchain.getDifference rt:(vector int) = catchain.Difference;
-catchain.getBlockHistory block:int256 height:long stop_if:(vector int256) = catchain.Sent;
 //catchain.getForkDifference src:int fork:catchain.fork = catchain.ForkDifference;
 
 ---types---
@@ -304,13 +339,19 @@ validatorSession.candidateId src:int256 root_hash:int256 file_hash:int256 collat
 
 validatorSession.blockUpdate ts:long actions:(vector validatorSession.round.Message) state:int = validatorSession.BlockUpdate;
 validatorSession.candidate src:int256 round:int root_hash:int256 data:bytes collated_data:bytes = validatorSession.Candidate;
+validatorSession.compressedCandidate flags:# src:int256 round:int root_hash:int256 decompressed_size:int data:bytes = validatorSession.Candidate;
 
 validatorSession.config catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
         max_round_attempts:int max_block_size:int max_collated_data_size:int = validatorSession.Config;
-validatorSession.configVersioned catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
-        max_round_attempts:int max_block_size:int max_collated_data_size:int version:int = validatorSession.Config;
 validatorSession.configNew catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
         max_round_attempts:int max_block_size:int max_collated_data_size:int new_catchain_ids:Bool = validatorSession.Config;
+validatorSession.configVersioned catchain_idle_timeout:double catchain_max_deps:int round_candidates:int next_candidate_delay:double round_attempt_duration:int
+        max_round_attempts:int max_block_size:int max_collated_data_size:int version:int = validatorSession.Config;
+
+validatorSession.catchainOptions idle_timeout:double max_deps:int max_block_size:int block_hash_covers_data:Bool
+        max_block_height_ceoff:int debug_disable_db:Bool = validatorSession.CatChainOptions;
+validatorSession.configVersionedV2 catchain_opts:validatorSession.CatChainOptions round_candidates:int next_candidate_delay:double
+        round_attempt_duration:int max_round_attempts:int max_block_size:int max_collated_data_size:int version:int = validatorSession.Config;
 
 ---functions---
 
@@ -355,6 +396,7 @@ tonNode.blockSignature who:int256 signature:bytes = tonNode.BlockSignature;
 tonNode.blockId workchain:int shard:long seqno:int = tonNode.BlockId;
 tonNode.blockIdExt workchain:int shard:long seqno:int root_hash:int256 file_hash:int256 = tonNode.BlockIdExt;
 tonNode.zeroStateIdExt workchain:int root_hash:int256 file_hash:int256 = tonNode.ZeroStateIdExt;
+tonNode.shardId workchain:int shard:long = tonNode.ShardId;
 
 tonNode.blockDescriptionEmpty = tonNode.BlockDescription;
 tonNode.blockDescription id:tonNode.blockIdExt = tonNode.BlockDescription;
@@ -375,31 +417,48 @@ tonNode.externalMessage data:bytes = tonNode.ExternalMessage;
 
 tonNode.newShardBlock block:tonNode.blockIdExt cc_seqno:int data:bytes = tonNode.NewShardBlock;
 
-tonNode.blockBroadcast id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int 
-              signatures:(vector tonNode.blockSignature) 
+tonNode.blockBroadcastCompressed.data signatures:(vector tonNode.blockSignature) proof_data:bytes = tonNode.blockBroadcaseCompressed.Data;
+
+tonNode.blockBroadcast id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
+              signatures:(vector tonNode.blockSignature)
               proof:bytes data:bytes = tonNode.Broadcast;
+tonNode.blockBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
+              flags:# compressed:bytes = tonNode.Broadcast;
 tonNode.ihrMessageBroadcast message:tonNode.ihrMessage = tonNode.Broadcast;
 tonNode.externalMessageBroadcast message:tonNode.externalMessage = tonNode.Broadcast;
 tonNode.newShardBlockBroadcast block:tonNode.newShardBlock = tonNode.Broadcast;
+// signature may be empty, at least for now
+tonNode.newBlockCandidateBroadcast id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
+              collator_signature:tonNode.blockSignature data:bytes = tonNode.Broadcast;
+tonNode.newBlockCandidateBroadcastCompressed id:tonNode.blockIdExt catchain_seqno:int validator_set_hash:int
+              collator_signature:tonNode.blockSignature flags:# compressed:bytes = tonNode.Broadcast;
 
 tonNode.shardPublicOverlayId workchain:int shard:long zero_state_file_hash:int256 = tonNode.ShardPublicOverlayId;
+
+tonNode.privateBlockOverlayId zero_state_file_hash:int256 nodes:(vector int256) = tonNode.PrivateBlockOverlayId;
+tonNode.customOverlayId zero_state_file_hash:int256 name:string nodes:(vector int256) = tonNode.CustomOverlayId;
 
 tonNode.keyBlocks blocks:(vector tonNode.blockIdExt) incomplete:Bool error:Bool = tonNode.KeyBlocks;
 
 ton.blockId root_cell_hash:int256 file_hash:int256 = ton.BlockId;
 ton.blockIdApprove root_cell_hash:int256 file_hash:int256 = ton.BlockId;
 
-tonNode.dataList data:(vector bytes) = tonNode.DataList;
-
 tonNode.dataFull id:tonNode.blockIdExt proof:bytes block:bytes is_link:Bool = tonNode.DataFull;
+tonNode.dataFullCompressed id:tonNode.blockIdExt flags:# compressed:bytes is_link:Bool = tonNode.DataFull;
 tonNode.dataFullEmpty = tonNode.DataFull;
 
-tonNode.capabilities version:int capabilities:long = tonNode.Capabilities;
+tonNode.capabilities#f5bf60c0 version_major:int version_minor:int flags:# = tonNode.Capabilities;
 
 tonNode.success = tonNode.Success;
 
 tonNode.archiveNotFound = tonNode.ArchiveInfo;
 tonNode.archiveInfo id:long = tonNode.ArchiveInfo;
+
+tonNode.importedMsgQueueLimits max_bytes:int max_msgs:int = ImportedMsgQueueLimits;
+tonNode.outMsgQueueProof queue_proofs:bytes block_state_proofs:bytes msg_counts:(vector int) = tonNode.OutMsgQueueProof;
+tonNode.outMsgQueueProofEmpty = tonNode.OutMsgQueueProof;
+
+tonNode.forgetPeer = tonNode.ForgetPeer;
 
 ---functions---
 
@@ -418,20 +477,18 @@ tonNode.getNextKeyBlockIds block:tonNode.blockIdExt max_size:int = tonNode.KeyBl
 tonNode.downloadNextBlockFull prev_block:tonNode.blockIdExt = tonNode.DataFull;
 tonNode.downloadBlockFull block:tonNode.blockIdExt = tonNode.DataFull;
 tonNode.downloadBlock block:tonNode.blockIdExt = tonNode.Data;
-tonNode.downloadBlocks blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
 tonNode.downloadPersistentState block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadPersistentStateSlice block:tonNode.blockIdExt masterchain_block:tonNode.blockIdExt offset:long max_size:long = tonNode.Data;
 tonNode.downloadZeroState block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadBlockProof block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadKeyBlockProof block:tonNode.blockIdExt = tonNode.Data;
-tonNode.downloadBlockProofs blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
-tonNode.downloadKeyBlockProofs blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
 tonNode.downloadBlockProofLink block:tonNode.blockIdExt = tonNode.Data;
 tonNode.downloadKeyBlockProofLink block:tonNode.blockIdExt = tonNode.Data;
-tonNode.downloadBlockProofLinks blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
-tonNode.downloadKeyBlockProofLinks blocks:(vector tonNode.blockIdExt) = tonNode.DataList;
 tonNode.getArchiveInfo masterchain_seqno:int = tonNode.ArchiveInfo;
+tonNode.getShardArchiveInfo masterchain_seqno:int shard_prefix:tonNode.shardId = tonNode.ArchiveInfo;
 tonNode.getArchiveSlice archive_id:long offset:long max_size:int = tonNode.Data;
+tonNode.getOutMsgQueueProof dst_shard:tonNode.shardId blocks:(vector tonNode.blockIdExt)
+    limits:tonNode.importedMsgQueueLimits = tonNode.OutMsgQueueProof;
 
 tonNode.getCapabilities = tonNode.Capabilities;
 
@@ -485,6 +542,7 @@ db.filedb.key.proof block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.proofLink block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.signatures block_id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.candidate id:db.candidate.id = db.filedb.Key;
+db.filedb.key.candidateRef id:tonNode.blockIdExt = db.filedb.Key;
 db.filedb.key.blockInfo block_id:tonNode.blockIdExt = db.filedb.Key;
 
 db.filedb.value key:db.filedb.Key prev:int256 next:int256 file_hash:int256 = db.filedb.Value;
@@ -496,6 +554,9 @@ db.state.shardClient block:tonNode.blockIdExt = db.state.ShardClient;
 db.state.asyncSerializer block:tonNode.blockIdExt last:tonNode.blockIdExt last_ts:int = db.state.AsyncSerializer;
 db.state.hardforks blocks:(vector tonNode.blockIdExt) = db.state.Hardforks;
 db.state.dbVersion version:int = db.state.DbVersion;
+db.state.persistentStateDescriptionShards shard_blocks:(vector tonNode.blockIdExt) = db.state.PersistentStateDescriptionShards;
+db.state.persistentStateDescriptionHeader masterchain_id:tonNode.blockIdExt start_time:int end_time:int = db.state.PersistentStateDescriptionHeader;
+db.state.persistentStateDescriptionsList list:(vector db.state.persistentStateDescriptionHeader) = db.state.PersistentStateDescriptionsList;
 
 db.state.key.destroyedSessions = db.state.Key;
 db.state.key.initBlockId = db.state.Key;
@@ -504,6 +565,8 @@ db.state.key.shardClient = db.state.Key;
 db.state.key.asyncSerializer = db.state.Key;
 db.state.key.hardforks = db.state.Key;
 db.state.key.dbVersion = db.state.Key;
+db.state.key.persistentStateDescriptionShards masterchain_seqno:int = db.state.Key;
+db.state.key.persistentStateDescriptionsList = db.state.Key;
 
 db.lt.el.key workchain:int shard:long idx:int = db.lt.Key;
 db.lt.desc.key workchain:int shard:long = db.lt.Key;
@@ -531,6 +594,10 @@ validator.group workchain:int shard:long catchain_seqno:int config_hash:int256 m
 validator.groupEx workchain:int shard:long vertical_seqno:int catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group; 
 validator.groupNew workchain:int shard:long vertical_seqno:int last_key_block_seqno:int catchain_seqno:int config_hash:int256 members:(vector validator.groupMember) = validator.Group; 
 
+validator.telemetry flags:# timestamp:double adnl_id:int256
+    node_version:string os_version:string node_started_at:int
+    ram_size:long cpu_cores:int node_threads:int = validator.Telemetry;
+
 ---functions---
 
 
@@ -548,14 +615,20 @@ control.config.local priv:PrivateKey pub:int256 port:int = control.config.Local;
 config.local local_ids:(vector id.config.local) dht:(vector dht.config.Local) validators:(vector validator.config.Local) liteservers:(vector liteserver.config.Local) control:(vector control.config.local) = config.Local;
 
 dht.config.global static_nodes:dht.nodes k:int a:int = dht.config.Global;
+dht.config.global_v2 static_nodes:dht.nodes k:int a:int network_id:int = dht.config.Global;
 adnl.config.global static_nodes:adnl.nodes = adnl.config.Global;
 catchain.config.global tag:int256 nodes:(vector PublicKey) = catchain.config.Global;
 dummyworkchain0.config.global zero_state_hash:int256 = dummyworkchain0.config.Global;
 validator.config.global zero_state:tonNode.blockIdExt init_block:tonNode.blockIdExt hardforks:(vector tonNode.blockIdExt) = validator.config.Global;
-config.global adnl:adnl.config.global dht:dht.config.global validator:validator.config.global = config.Global;
+config.global adnl:adnl.config.global dht:dht.config.Global validator:validator.config.global = config.Global;
+
+liteserver.descV2.sliceSimple shards:(vector tonNode.shardId) = liteserver.descV2.Slice;
+liteserver.descV2.shardInfo shard_id:tonNode.shardId seqno:int utime:int lt:long = liteserver.descV2.ShardInfo;
+liteserver.descV2.sliceTimed shards_from:(vector liteserver.descV2.shardInfo) shards_to:(vector liteserver.descV2.shardInfo) = liteserver.descV2.Slice;
 
 liteserver.desc id:PublicKey ip:int port:int = liteserver.Desc;
-liteclient.config.global liteservers:(vector liteserver.desc) validator:validator.config.global = liteclient.config.Global;
+liteserver.descV2 id:PublicKey ip:int port:int slices:(vector liteserver.descV2.Slice) = liteserver.DescV2;
+liteclient.config.global liteservers:(vector liteserver.desc) liteservers_v2:(vector liteserver.descV2) validator:validator.config.global = liteclient.config.Global;
 
 engine.adnl id:int256 category:int = engine.Adnl;
 engine.addr ip:int port:int categories:(vector int) priority_categories:(vector int) = engine.Addr;
@@ -573,12 +646,28 @@ engine.gc ids:(vector int256) = engine.Gc;
 engine.dht.config dht:(vector engine.dht) gc:engine.gc = engine.dht.Config;
 engine.validator.fullNodeMaster port:int adnl:int256 = engine.validator.FullNodeMaster;
 engine.validator.fullNodeSlave ip:int port:int adnl:PublicKey = engine.validator.FullNodeSlave;
-engine.validator.config out_port:int addrs:(vector engine.Addr) adnl:(vector engine.adnl) 
+engine.validator.fullNodeConfig ext_messages_broadcast_disabled:Bool = engine.validator.FullNodeConfig;
+engine.validator.extraConfig state_serializer_enabled:Bool = engine.validator.ExtraConfig;
+engine.validator.config out_port:int addrs:(vector engine.Addr) adnl:(vector engine.adnl)
         dht:(vector engine.dht)
         validators:(vector engine.validator) fullnode:int256 fullnodeslaves:(vector engine.validator.fullNodeSlave)
         fullnodemasters:(vector engine.validator.fullNodeMaster)
+        fullnodeconfig:engine.validator.fullNodeConfig
+        extraconfig:engine.validator.extraConfig
         liteservers:(vector engine.liteServer) control:(vector engine.controlInterface)
-        gc:engine.gc = engine.validator.Config; 
+        shards_to_monitor:(vector tonNode.shardId)
+        gc:engine.gc = engine.validator.Config;
+
+engine.validator.customOverlayNode adnl_id:int256 msg_sender:Bool msg_sender_priority:int block_sender:Bool = engine.validator.CustomOverlayNode;
+engine.validator.customOverlay name:string nodes:(vector engine.validator.customOverlayNode) sender_shards:(vector tonNode.shardId)
+    = engine.validator.CustomOverlay;
+engine.validator.customOverlaysConfig overlays:(vector engine.validator.customOverlay) = engine.validator.CustomOverlaysConfig;
+
+engine.validator.collatorOptions
+  deferring_enabled:Bool defer_messages_after:int defer_out_queue_size_limit:long
+  dispatch_phase_2_max_total:int dispatch_phase_3_max_total:int
+  dispatch_phase_2_max_per_initiator:int dispatch_phase_3_max_per_initiator:int
+  whitelist:(vector string) prioritylist:(vector string) = engine.validator.CollatorOptions;
 
 ---functions---
 ---types---
@@ -604,6 +693,7 @@ engine.validator.signature signature:bytes = engine.validator.Signature;
 
 engine.validator.oneStat key:string value:string = engine.validator.OneStat;
 engine.validator.stats stats:(vector engine.validator.oneStat) = engine.validator.Stats;
+engine.validator.textStats data:string = engine.validator.TextStats;
 
 engine.validator.controlQueryError code:int message:string = engine.validator.ControlQueryError;
 
@@ -617,6 +707,32 @@ engine.validator.proposalVote perm_key:int256 to_send:bytes = engine.validator.P
 
 engine.validator.dhtServerStatus id:int256 status:int = engine.validator.DhtServerStatus;
 engine.validator.dhtServersStatus servers:(vector engine.validator.dhtServerStatus) = engine.validator.DhtServersStatus;
+
+engine.validator.overlayStatsTraffic t_out_bytes:long t_in_bytes:long t_out_pckts:int t_in_pckts:int = engine.validator.OverlayStatsTraffic;
+
+engine.validator.overlayStatsNode adnl_id:int256 ip_addr:string is_neighbour:Bool is_alive:Bool node_flags:int
+    bdcst_errors:int fec_bdcst_errors:int last_in_query:int last_out_query:int
+    traffic:engine.validator.overlayStatsTraffic traffic_responses:engine.validator.overlayStatsTraffic = engine.validator.OverlayStatsNode;
+
+engine.validator.overlayStats overlay_id:int256 overlay_id_full:PublicKey adnl_id:int256 scope:string
+    nodes:(vector engine.validator.overlayStatsNode) stats:(vector engine.validator.oneStat)
+    total_traffic:engine.validator.overlayStatsTraffic total_traffic_responses:engine.validator.overlayStatsTraffic
+    extra:string = engine.validator.OverlayStats;
+engine.validator.overlaysStats overlays:(vector engine.validator.overlayStats) = engine.validator.OverlaysStats;
+
+engine.validator.shardOverlayStats.neighbour id:string verison_major:int version_minor:int flags:#
+    roundtrip:double unreliability:double = engine.validator.shardOverlayStats.Neighbour;
+engine.validator.shardOverlayStats shard:string active:Bool
+    neighbours:(vector engine.validator.shardOverlayStats.neighbour) = engine.validator.ShardOverlayStats;
+
+engine.validator.onePerfTimerStat time:int min:double avg:double max:double = engine.validator.OnePerfTimerStat;
+engine.validator.perfTimerStatsByName name:string stats:(vector engine.validator.OnePerfTimerStat) = engine.validator.PerfTimerStatsByName;
+engine.validator.perfTimerStats stats:(vector engine.validator.PerfTimerStatsByName) = engine.validator.PerfTimerStats;
+
+engine.validator.shardOutQueueSize size:long = engine.validator.ShardOutQueueSize;
+
+engine.validator.exportedPrivateKeys encrypted_data:bytes = engine.validator.ExportedPrivateKeys;
+
 
 ---functions---
 
@@ -647,6 +763,7 @@ engine.validator.delListeningPort ip:int port:int categories:(vector int) priori
 engine.validator.delProxy out_ip:int out_port:int categories:(vector int) priority_categories:(vector int) = engine.validator.Success;
 
 engine.validator.sign key_hash:int256 data:bytes = engine.validator.Signature;
+engine.validator.exportAllPrivateKeys encryption_key:PublicKey = engine.validator.ExportedPrivateKeys;
 
 engine.validator.getStats = engine.validator.Stats;
 engine.validator.getConfig = engine.validator.JsonConfig;
@@ -659,7 +776,32 @@ engine.validator.createComplaintVote election_id:int vote:bytes = engine.validat
 
 engine.validator.checkDhtServers id:int256 = engine.validator.DhtServersStatus;
 
+engine.validator.getOverlaysStats = engine.validator.OverlaysStats;
+
 engine.validator.controlQuery data:bytes = Object;
+
+engine.validator.importCertificate overlay_id:int256 local_id:adnl.id.short signed_key:engine.validator.KeyHash cert:overlay.Certificate = engine.validator.Success;
+engine.validator.signShardOverlayCertificate workchain:int shard:long signed_key:engine.validator.KeyHash expire_at:int max_size:int = overlay.Certificate;
+engine.validator.importShardOverlayCertificate workchain:int shard:long signed_key:engine.validator.KeyHash cert:overlay.Certificate = engine.validator.Success;
+
+engine.validator.getPerfTimerStats name:string = engine.validator.PerfTimerStats;
+engine.validator.getShardOutQueueSize flags:# block_id:tonNode.blockId dest_wc:flags.0?int dest_shard:flags.0?long = engine.validator.ShardOutQueueSize;
+engine.validator.setExtMessagesBroadcastDisabled disabled:Bool = engine.validator.Success;
+
+engine.validator.addCustomOverlay overlay:engine.validator.customOverlay = engine.validator.Success;
+engine.validator.delCustomOverlay name:string = engine.validator.Success;
+engine.validator.showCustomOverlays = engine.validator.CustomOverlaysConfig;
+
+engine.validator.setStateSerializerEnabled enabled:Bool = engine.validator.Success;
+
+engine.validator.setCollatorOptionsJson json:string = engine.validator.Success;
+engine.validator.getCollatorOptionsJson = engine.validator.JsonConfig;
+
+engine.validator.getAdnlStats all:Bool = adnl.Stats;
+engine.validator.getActorTextStats = engine.validator.TextStats;
+
+engine.validator.addShard shard:tonNode.shardId = engine.validator.Success;
+engine.validator.delShard shard:tonNode.shardId = engine.validator.Success;
 
 ---types---
 
@@ -668,8 +810,9 @@ storage.ok = Ok;
 
 storage.state will_upload:Bool want_download:Bool = storage.State;
 storage.piece proof:bytes data:bytes = storage.Piece;
+storage.torrentInfo data:bytes = storage.TorrentInfo;
 
-storage.updateInit have_pieces:bytes state:storage.State = storage.Update;
+storage.updateInit have_pieces:bytes have_pieces_offset:int state:storage.State = storage.Update;
 storage.updateHavePieces piece_id:(vector int) = storage.Update;
 storage.updateState state:storage.State = storage.Update;
 
@@ -678,20 +821,21 @@ storage.updateState state:storage.State = storage.Update;
 storage.ping session_id:long = storage.Pong;
 storage.addUpdate session_id:long seqno:int update:storage.Update = Ok;
 
+storage.getTorrentInfo = storage.TorrentInfo;
 storage.getPiece piece_id:int = storage.Piece;
-
-storage.queryPrefix id:int256 = Object;
 
 ---types---
 
 http.header name:string value:string = http.Header;
 http.payloadPart data:bytes trailer:(vector http.header) last:Bool = http.PayloadPart;
-http.response http_version:string status_code:int reason:string headers:(vector http.header) = http.Response;
+http.response http_version:string status_code:int reason:string headers:(vector http.header) no_payload:Bool = http.Response;
+http.proxy.capabilities capabilities:long = http.proxy.Capabilities;
 
 ---functions---
 
 http.request id:int256 method:string url:string http_version:string headers:(vector http.header) = http.Response;
 http.getNextPayloadPart id:int256 seqno:int max_chunk_size:int = http.PayloadPart;
+http.proxy.getCapabilities capabilities:long = http.proxy.Capabilities;
 
 ---types---
 
@@ -702,3 +846,177 @@ http.server.host domains:(vector string) ip:int port:int adnl_id:adnl.id.short =
 http.server.config dhs:(vector http.server.dnsEntry) local_hosts:(vector http.server.host) = http.server.Config;
 
 ---functions---
+
+---types---
+
+validatorSession.collationStats bytes:int gas:int lt_delta:int cat_bytes:int cat_gas:int cat_lt_delta:int
+  limits_log:string ext_msgs_total:int ext_msgs_filtered:int ext_msgs_accepted:int ext_msgs_rejected:int = validadorSession.CollationStats;
+
+validatorSession.statsProducer id:int256 candidate_id:int256 block_status:int root_hash:int256 file_hash:int256
+  comment:string block_timestamp:double is_accepted:Bool is_ours:Bool got_submit_at:double
+  collation_time:double collated_at:double collation_cached:Bool
+  collation_work_time:double collation_cpu_work_time:double
+  collation_stats:validatorSession.collationStats
+  validation_time:double validated_at:double validation_cached:Bool
+  validation_work_time:double validation_cpu_work_time:double
+  gen_utime:double
+  approved_weight:long approved_33pct_at:double approved_66pct_at:double approvers:string
+  signed_weight:long signed_33pct_at:double signed_66pct_at:double signers:string
+  serialize_time:double deserialize_time:double serialized_size:int = validatorSession.StatsProducer;
+
+validatorSession.statsRound timestamp:double producers:(vector validatorSession.statsProducer) = validatorSession.StatsRound;
+
+validatorSession.stats success:Bool id:tonNode.blockIdExt timestamp:double self:int256 session_id:int256 cc_seqno:int
+    creator:int256 total_validators:int total_weight:long
+    signatures:int signatures_weight:long approve_signatures:int approve_signatures_weight:long
+    first_round:int rounds:(vector validatorSession.statsRound) = validatorSession.Stats;
+
+validatorSession.newValidatorGroupStats.node id:int256 weight:long = validatorSession.newValidatorGroupStats.Node;
+validatorSession.newValidatorGroupStats session_id:int256 workchain:int shard:long cc_seqno:int
+    last_key_block_seqno:int timestamp:double
+    self_idx:int nodes:(vector validatorSession.newValidatorGroupStats.node) = validatorSession.NewValidatorGroupStats;
+
+validatorSession.endValidatorGroupStats.node id:int256 catchain_blocks:int = validatorSession.endValidatorGroupStats.Node;
+validatorSession.endValidatorGroupStats session_id:int256 timestamp:double
+    nodes:(vector validatorSession.endValidatorGroupStats.node) = validatorSession.EndValidatorGroupStats;
+
+---functions---
+
+---types---
+
+storage.db.key.torrentList = storage.db.key.TorrentList;
+storage.db.key.torrent hash:int256 = storage.db.key.TorrentShort;
+storage.db.key.torrentMeta hash:int256 = storage.db.key.TorrentMeta;
+storage.db.key.priorities hash:int256 = storage.db.key.Priorities;
+storage.db.key.piecesInDb hash:int256 = storage.db.key.PiecesInDb;
+storage.db.key.pieceInDb hash:int256 idx:long = storage.db.key.PieceInDb;
+storage.db.key.config = storage.db.key.Config;
+
+storage.db.config flags:# download_speed_limit:double upload_speed_limit:double = storage.db.Config;
+storage.db.torrentList torrents:(vector int256) = storage.db.TorrentList;
+storage.db.torrent root_dir:string active_download:Bool active_upload:Bool = storage.db.TorrentShort;
+storage.db.torrentV2 flags:# root_dir:string added_at:int active_download:Bool active_upload:Bool = storage.db.TorrentShort;
+storage.db.priorities actions:(vector storage.PriorityAction) = storage.db.Priorities;
+storage.db.piecesInDb pieces:(vector long) = storage.db.PiecesInDb;
+
+storage.priorityAction.all priority:int = storage.PriorityAction;
+storage.priorityAction.idx idx:long priority:int = storage.PriorityAction;
+storage.priorityAction.name name:string priority:int = storage.PriorityAction;
+
+storage.daemon.config server_key:PublicKey cli_key_hash:int256 provider_address:string adnl_id:PublicKey dht_id:PublicKey = storage.daemon.provider.Config;
+
+storage.daemon.provider.params accept_new_contracts:Bool rate_per_mb_day:string max_span:int
+    minimal_file_size:long maximal_file_size:long = storage.daemon.provider.Params;
+
+storage.provider.db.key.state = storage.provider.db.key.State;
+storage.provider.db.key.contractList = storage.provider.db.key.ContractList;
+storage.provider.db.key.storageContract wc:int addr:int256 = storage.provider.db.key.StorageContract;
+storage.provider.db.key.microchunkTree wc:int addr:int256 = storage.provider.db.key.MicrochunkTree;
+storage.provider.db.key.providerConfig = storage.provider.db.key.ProviderConfig;
+
+storage.provider.db.state last_processed_lt:long = storage.provider.db.State;
+storage.provider.db.contractAddress wc:int addr:int256 = storage.db.ContractAddress;
+storage.provider.db.contractList contracts:(vector storage.provider.db.contractAddress) = storage.db.ContractList;
+storage.provider.db.storageContract torrent_hash:int256 microchunk_hash:int256 created_time:int state:int file_size:long
+    rate:string max_span:int = storage.provider.db.StorageContract;
+storage.provider.db.microchunkTree data:bytes = storage.provider.db.MicrochunkTree;
+
+storage.daemon.queryError message:string = storage.daemon.QueryError;
+storage.daemon.success = storage.daemon.Success;
+
+storage.daemon.torrent
+    hash:int256 flags:#
+    // 0 - info ready
+    // 1 - header ready
+    // 2 - fatal error
+    total_size:flags.0?long description:flags.0?string
+    files_count:flags.1?long included_size:flags.1?long dir_name:flags.1?string
+    downloaded_size:long
+    added_at:int root_dir:string active_download:Bool active_upload:Bool completed:Bool
+    download_speed:double upload_speed:double
+    fatal_error:flags.2?string
+    = storage.daemon.Torrent;
+
+storage.daemon.fileInfo
+    name:string size:long flags:#
+    priority:int
+    downloaded_size:long
+    = storage.daemon.FileInfo;
+
+storage.daemon.torrentFull torrent:storage.daemon.torrent files:(vector storage.daemon.fileInfo) = storage.daemon.TorrentFull;
+storage.daemon.torrentList torrents:(vector storage.daemon.torrent) = storage.daemon.TorrentList;
+storage.daemon.torrentMeta meta:bytes = storage.daemon.TorrentMeta;
+
+storage.daemon.filePiecesInfo name:string range_l:long range_r:long = storage.daemon.FilePiecesInfo;
+storage.daemon.torrentPiecesInfo
+    flags:# // 0 - with file ranges
+    total_pieces:long piece_size:int
+    range_l:long range_r:long piece_ready_bitset:bytes
+    files:flags.0?(vector storage.daemon.filePiecesInfo) // files[0] is header
+    = storage.daemon.TorrentPiecesInfo;
+
+storage.daemon.newContractParams rate:string max_span:int = storage.daemon.NewContractParams;
+storage.daemon.newContractParamsAuto provider_address:string = storage.daemon.NewContractParams;
+storage.daemon.newContractMessage body:bytes rate:string max_span:int = storage.daemon.NewContractMessage;
+
+storage.daemon.peer adnl_id:int256 ip_str:string download_speed:double upload_speed:double ready_parts:long = storage.daemon.Peer;
+storage.daemon.peerList peers:(vector storage.daemon.peer) download_speed:double upload_speed:double total_parts:long = storage.daemon.PeerList;
+
+storage.daemon.prioritySet = storage.daemon.SetPriorityStatus;
+storage.daemon.priorityPending = storage.daemon.SetPriorityStatus;
+
+storage.daemon.keyHash key_hash:int256 = storage.daemon.KeyHash;
+
+storage.daemon.speedLimits download:double upload:double = storage.daemon.SpeedLimits;
+
+storage.daemon.providerConfig max_contracts:int max_total_size:long = storage.daemon.ProviderConfig;
+storage.daemon.contractInfo address:string state:int torrent:int256 created_time:int file_size:long downloaded_size:long
+    rate:string max_span:int client_balance:string contract_balance:string = storage.daemon.ContractInfo;
+storage.daemon.providerInfo address:string balance:string config:storage.daemon.providerConfig
+    contracts_count:int contracts_total_size:long
+    contracts:(vector storage.daemon.contractInfo) = storage.daemon.ProviderInfo;
+storage.daemon.providerAddress address:string = storage.daemon.ProviderAddress;
+
+---functions---
+storage.daemon.setVerbosity verbosity:int = storage.daemon.Success;
+storage.daemon.createTorrent path:string description:string allow_upload:Bool copy_inside:Bool flags:# = storage.daemon.TorrentFull;
+storage.daemon.addByHash hash:int256 root_dir:string start_download:Bool allow_upload:Bool priorities:(vector storage.PriorityAction) flags:# = storage.daemon.TorrentFull;
+storage.daemon.addByMeta meta:bytes root_dir:string start_download:Bool allow_upload:Bool priorities:(vector storage.PriorityAction) flags:# = storage.daemon.TorrentFull;
+storage.daemon.setActiveDownload hash:int256 active:Bool = storage.daemon.Success;
+storage.daemon.setActiveUpload hash:int256 active:Bool = storage.daemon.Success;
+
+storage.daemon.getTorrents flags:# = storage.daemon.TorrentList;
+storage.daemon.getTorrentFull hash:int256 flags:# = storage.daemon.TorrentFull;
+storage.daemon.getTorrentMeta hash:int256 flags:# = storage.daemon.TorrentMeta;
+storage.daemon.getNewContractMessage hash:int256 query_id:long params:storage.daemon.NewContractParams = storage.daemon.NewContractMessage;
+storage.daemon.getTorrentPeers hash:int256 flags:# = storage.daemon.PeerList;
+storage.daemon.getTorrentPiecesInfo hash:int256
+    flags:# // 0 - with file ranges
+    offset:long max_pieces:long
+    = storage.daemon.TorrentPiecesInfo;
+
+storage.daemon.setFilePriorityAll hash:int256 priority:int = storage.daemon.SetPriorityStatus;
+storage.daemon.setFilePriorityByIdx hash:int256 idx:long priority:int = storage.daemon.SetPriorityStatus;
+storage.daemon.setFilePriorityByName hash:int256 name:string priority:int = storage.daemon.SetPriorityStatus;
+
+storage.daemon.removeTorrent hash:int256 remove_files:Bool = storage.daemon.Success;
+storage.daemon.loadFrom hash:int256 meta:bytes path:string flags:# = storage.daemon.Torrent;
+
+storage.daemon.getSpeedLimits flags:# = storage.daemon.SpeedLimits;
+storage.daemon.setSpeedLimits flags:# download:flags.0?double upload:flags.1?double = storage.daemon.Success;
+
+
+storage.daemon.importPrivateKey key:PrivateKey = storage.daemon.KeyHash;
+storage.daemon.initProvider account_address:string = storage.daemon.Success;
+storage.daemon.deployProvider = storage.daemon.ProviderAddress;
+storage.daemon.getProviderParams address:string = storage.daemon.provider.Params;
+storage.daemon.setProviderParams params:storage.daemon.provider.params = storage.daemon.Success;
+storage.daemon.getProviderInfo with_balances:Bool with_contracts:Bool = storage.daemon.ProviderInfo;
+storage.daemon.setProviderConfig config:storage.daemon.providerConfig = storage.daemon.Success;
+storage.daemon.withdraw contract:string = storage.daemon.Success;
+storage.daemon.sendCoins address:string amount:string message:string = storage.daemon.Success;
+storage.daemon.closeStorageContract address:string = storage.daemon.Success;
+storage.daemon.removeStorageProvider = storage.daemon.Success;
+
+---types---
+proxyLiteserver.config port:int id:PublicKey = proxyLiteserver.Config;

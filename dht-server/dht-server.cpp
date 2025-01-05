@@ -54,7 +54,7 @@ Config::Config() {
   out_port = 3278;
 }
 
-Config::Config(ton::ton_api::engine_validator_config &config) {
+Config::Config(const ton::ton_api::engine_validator_config &config) {
   out_port = static_cast<td::uint16>(config.out_port_);
   if (!out_port) {
     out_port = 3278;
@@ -162,6 +162,7 @@ ton::tl_object_ptr<ton::ton_api::engine_validator_config> Config::tl() const {
     control_vec.push_back(ton::create_tl_object<ton::ton_api::engine_controlInterface>(x.second.key.tl(), x.first,
                                                                                        std::move(control_proc_vec)));
   }
+  std::vector<ton::tl_object_ptr<ton::ton_api::tonNode_shardId>> shard_vec;
 
   auto gc_vec = ton::create_tl_object<ton::ton_api::engine_gc>(std::vector<td::Bits256>{});
   for (auto &id : gc) {
@@ -170,7 +171,7 @@ ton::tl_object_ptr<ton::ton_api::engine_validator_config> Config::tl() const {
   return ton::create_tl_object<ton::ton_api::engine_validator_config>(
       out_port, std::move(addrs_vec), std::move(adnl_vec), std::move(dht_vec), std::move(val_vec),
       ton::PublicKeyHash::zero().tl(), std::move(full_node_slaves_vec), std::move(full_node_masters_vec),
-      std::move(liteserver_vec), std::move(control_vec), std::move(gc_vec));
+      nullptr, nullptr, std::move(liteserver_vec), std::move(control_vec), std::move(shard_vec), std::move(gc_vec));
 }
 
 td::Result<bool> Config::config_add_network_addr(td::IPAddress in_ip, td::IPAddress out_ip,
@@ -573,6 +574,12 @@ void DhtServer::load_config(td::Promise<td::Unit> promise) {
   }
   auto conf_data_R = td::read_file(config_file_);
   if (conf_data_R.is_error()) {
+    conf_data_R = td::read_file(temp_config_file());
+    if (conf_data_R.is_ok()) {
+      td::rename(temp_config_file(), config_file_).ensure();
+    }
+  }
+  if (conf_data_R.is_error()) {
     auto P = td::PromiseCreator::lambda(
         [name = local_config_, new_name = config_file_, promise = std::move(promise)](td::Result<td::Unit> R) {
           if (R.is_error()) {
@@ -620,12 +627,15 @@ void DhtServer::load_config(td::Promise<td::Unit> promise) {
 void DhtServer::write_config(td::Promise<td::Unit> promise) {
   auto s = td::json_encode<std::string>(td::ToJson(*config_.tl().get()), true);
 
-  auto S = td::write_file(config_file_, s);
-  if (S.is_ok()) {
-    promise.set_value(td::Unit());
-  } else {
+  auto S = td::write_file(temp_config_file(), s);
+  if (S.is_error()) {
+    td::unlink(temp_config_file()).ignore();
     promise.set_error(std::move(S));
+    return;
   }
+  td::unlink(config_file_).ignore();
+  TRY_STATUS_PROMISE(promise, td::rename(temp_config_file(), config_file_));
+  promise.set_value(td::Unit());
 }
 
 td::Promise<ton::PublicKey> DhtServer::get_key_promise(td::MultiPromise::InitGuard &ig) {
@@ -1222,15 +1232,19 @@ int main(int argc, char *argv[]) {
   });
   td::uint32 threads = 7;
   p.add_checked_option(
-      't', "threads", PSTRING() << "number of threads (default=" << threads << ")", [&](td::Slice fname) {
+      't', "threads", PSTRING() << "number of threads (default=" << threads << ")", [&](td::Slice arg) {
         td::int32 v;
         try {
-          v = std::stoi(fname.str());
+          v = std::stoi(arg.str());
         } catch (...) {
           return td::Status::Error(ton::ErrorCode::error, "bad value for --threads: not a number");
         }
-        if (v < 1 || v > 256) {
-          return td::Status::Error(ton::ErrorCode::error, "bad value for --threads: should be in range [1..256]");
+        if (v <= 0) {
+          return td::Status::Error(ton::ErrorCode::error, "bad value for --threads: should be > 0");
+        }
+        if (v > 127) {
+          LOG(WARNING) << "`--threads " << v << "` is too big, effective value will be 127";
+          v = 127;
         }
         threads = v;
         return td::Status::OK();

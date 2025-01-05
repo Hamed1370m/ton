@@ -97,6 +97,8 @@ void define_keywords() {
       .add_keyword("do", Kw::_Do)
       .add_keyword("while", Kw::_While)
       .add_keyword("until", Kw::_Until)
+      .add_keyword("try", Kw::_Try)
+      .add_keyword("catch", Kw::_Catch)
       .add_keyword("if", Kw::_If)
       .add_keyword("ifnot", Kw::_Ifnot)
       .add_keyword("then", Kw::_Then)
@@ -125,7 +127,11 @@ void define_keywords() {
       .add_keyword("operator", Kw::_Operator)
       .add_keyword("infix", Kw::_Infix)
       .add_keyword("infixl", Kw::_Infixl)
-      .add_keyword("infixr", Kw::_Infixr);
+      .add_keyword("infixr", Kw::_Infixr)
+      .add_keyword("const", Kw::_Const);
+
+  sym::symbols.add_keyword("#pragma", Kw::_PragmaHashtag)
+      .add_keyword("#include", Kw::_IncludeHashtag);
 }
 
 }  // namespace funC

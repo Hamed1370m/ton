@@ -38,9 +38,11 @@ class ShardStateQ : virtual public ShardState {
   Ref<vm::Cell> root;
   LogicalTime lt{0};
   UnixTime utime{0};
+  td::int32 global_id_{0};
   bool before_split_{false};
   bool fake_split_{false};
   bool fake_merge_{false};
+  td::optional<BlockIdExt> master_ref;
 
  protected:
   friend class Ref<ShardStateQ>;
@@ -80,6 +82,12 @@ class ShardStateQ : virtual public ShardState {
   LogicalTime get_logical_time() const override {
     return lt;
   }
+  td::int32 get_global_id() const override {
+    return global_id_;
+  }
+  td::optional<BlockIdExt> get_master_ref() const override {
+    return master_ref;
+  }
   td::Status validate_deep() const override;
   ShardStateQ* make_copy() const override;
   td::Result<Ref<MessageQueue>> message_queue() const override;
@@ -87,6 +95,7 @@ class ShardStateQ : virtual public ShardState {
   td::Result<Ref<ShardState>> merge_with(const ShardState& with) const override;
   td::Result<std::pair<Ref<ShardState>, Ref<ShardState>>> split() const override;
   td::Result<td::BufferSlice> serialize() const override;
+  td::Status serialize_to_file(td::FileFd& fd) const override;
 };
 
 #if TD_MSVC
@@ -115,8 +124,8 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
   bool has_workchain(WorkchainId workchain) const {
     return config_ && config_->has_workchain(workchain);
   }
+  td::uint32 monitor_min_split_depth(WorkchainId workchain_id) const override;
   td::uint32 min_split_depth(WorkchainId workchain_id) const override;
-  td::uint32 soft_min_split_depth(WorkchainId workchain_id) const override;
   BlockSeqno min_ref_masterchain_seqno() const override;
   td::Status prepare() override;
   ZeroStateIdExt get_zerostate_id() const {
@@ -125,9 +134,14 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
   ValidatorSessionConfig get_consensus_config() const override {
     return config_->get_consensus_config();
   }
+  block::SizeLimitsConfig::ExtMsgLimits get_ext_msg_limits() const override {
+    auto R = config_->get_size_limits_config();
+    return R.is_error() ? block::SizeLimitsConfig::ExtMsgLimits() : R.ok_ref().ext_msg_limits;
+  }
   BlockIdExt last_key_block_id() const override;
   BlockIdExt next_key_block_id(BlockSeqno seqno) const override;
   BlockIdExt prev_key_block_id(BlockSeqno seqno) const override;
+  bool is_key_state() const override;
   MasterchainStateQ* make_copy() const override;
 
   static td::Result<Ref<MasterchainStateQ>> fetch(const BlockIdExt& _id, td::BufferSlice _data,
@@ -145,6 +159,9 @@ class MasterchainStateQ : public MasterchainState, public ShardStateQ {
     } else {
       return td::make_ref<ConfigHolderQ>(config_);
     }
+  }
+  block::WorkchainSet get_workchain_list() const override {
+    return config_ ? config_->get_workchain_list() : block::WorkchainSet();
   }
 
  private:

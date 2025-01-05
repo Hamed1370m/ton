@@ -150,8 +150,8 @@ void ValidatorManagerImpl::get_key_block_proof_link(BlockIdExt block_id, td::Pro
   td::actor::send_closure(db_, &Db::get_key_block_proof_link, block_id, std::move(P));
 }
 
-void ValidatorManagerImpl::new_external_message(td::BufferSlice data) {
-  auto R = create_ext_message(std::move(data));
+void ValidatorManagerImpl::new_external_message(td::BufferSlice data, int priority) {
+  auto R = create_ext_message(std::move(data), block::SizeLimitsConfig::ExtMsgLimits());
   if (R.is_ok()) {
     ext_messages_.emplace_back(R.move_as_ok());
   }
@@ -357,9 +357,13 @@ void ValidatorManagerImpl::wait_block_message_queue_short(BlockIdExt block_id, t
   get_block_handle(block_id, true, std::move(P));
 }
 
-void ValidatorManagerImpl::get_external_messages(ShardIdFull shard,
-                                                 td::Promise<std::vector<td::Ref<ExtMessage>>> promise) {
-  promise.set_result(ext_messages_);
+void ValidatorManagerImpl::get_external_messages(
+    ShardIdFull shard, td::Promise<std::vector<std::pair<td::Ref<ExtMessage>, int>>> promise) {
+  std::vector<std::pair<td::Ref<ExtMessage>, int>> res;
+  for (const auto &x : ext_messages_) {
+    res.emplace_back(x, 0);
+  }
+  promise.set_result(std::move(res));
 }
 
 void ValidatorManagerImpl::get_ihr_messages(ShardIdFull shard, td::Promise<std::vector<td::Ref<IhrMessage>>> promise) {
@@ -409,6 +413,11 @@ void ValidatorManagerImpl::get_block_candidate_from_db(PublicKey source, BlockId
                                                        FileHash collated_data_file_hash,
                                                        td::Promise<BlockCandidate> promise) {
   td::actor::send_closure(db_, &Db::get_block_candidate, source, id, collated_data_file_hash, std::move(promise));
+}
+
+void ValidatorManagerImpl::get_candidate_data_by_block_id_from_db(BlockIdExt id, td::Promise<td::BufferSlice> promise) {
+  td::actor::send_closure(db_, &Db::get_block_candidate_by_block_id, id,
+                          promise.wrap([](BlockCandidate &&b) { return std::move(b.data); }));
 }
 
 void ValidatorManagerImpl::get_block_proof_from_db(ConstBlockHandle handle, td::Promise<td::Ref<Proof>> promise) {
@@ -530,6 +539,10 @@ void ValidatorManagerImpl::get_block_handle(BlockIdExt id, bool force, td::Promi
   td::actor::send_closure(db_, &Db::get_block_handle, id, std::move(P));
 }
 
+void ValidatorManagerImpl::get_cell_db_reader(td::Promise<std::shared_ptr<vm::CellDbReader>> promise) {
+  td::actor::send_closure(db_, &Db::get_cell_db_reader, std::move(promise));
+}
+
 void ValidatorManagerImpl::register_block_handle(BlockHandle handle, td::Promise<BlockHandle> promise) {
   auto it = handles_.find(handle->id());
   if (it != handles_.end()) {
@@ -545,7 +558,7 @@ void ValidatorManagerImpl::register_block_handle(BlockHandle handle, td::Promise
 }
 
 void ValidatorManagerImpl::start_up() {
-  db_ = create_db_actor(actor_id(this), db_root_);
+  db_ = create_db_actor(actor_id(this), db_root_, opts_);
 }
 
 void ValidatorManagerImpl::try_get_static_file(FileHash file_hash, td::Promise<td::BufferSlice> promise) {

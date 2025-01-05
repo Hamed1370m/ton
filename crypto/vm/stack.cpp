@@ -21,6 +21,8 @@
 #include "vm/box.hpp"
 #include "vm/atom.h"
 #include "vm/vmstate.h"
+#include "vm/boc.h"
+#include "td/utils/misc.h"
 
 namespace td {
 template class td::Cnt<std::string>;
@@ -81,7 +83,15 @@ std::string StackEntry::to_lisp_string() const {
   return std::move(os).str();
 }
 
-void StackEntry::dump(std::ostream& os) const {
+static std::string cell_to_hex(const td::Ref<vm::Cell> &cell) {
+  auto boc = vm::std_boc_serialize(cell);
+  if (boc.is_ok()) {
+    return td::buffer_to_hex(boc.move_as_ok().as_slice());
+  }
+  return "???";
+}
+
+void StackEntry::dump(std::ostream& os, bool verbose) const {
   switch (tp) {
     case t_null:
       os << "(null)";
@@ -90,15 +100,42 @@ void StackEntry::dump(std::ostream& os) const {
       os << dec_string(as_int());
       break;
     case t_cell:
-      os << "C{" << static_cast<Ref<Cell>>(ref)->get_hash().to_hex() << "}";
+      if (ref.not_null()) {
+        if (verbose) {
+          os << "C{" << cell_to_hex(as_cell()) << "}";
+        } else {
+          os << "C{" << *as_cell() << "}";
+        }
+      } else {
+        os << "C{null}";
+      }
       break;
     case t_builder:
-      os << "BC{" << static_cast<Ref<CellBuilder>>(ref)->to_hex() << "}";
+      if (ref.not_null()) {
+        if (verbose) {
+          Ref<CellBuilder> cb = as_builder();
+          os << "BC{" << cell_to_hex(cb.write().finalize_novm()) << "}";
+        } else {
+          os << "BC{" << *as_builder() << "}";
+        }
+      } else {
+        os << "BC{null}";
+      }
       break;
     case t_slice: {
-      os << "CS{";
-      static_cast<Ref<CellSlice>>(ref)->dump(os, 1, false);
-      os << '}';
+      if (ref.not_null()) {
+        os << "CS{";
+        if (verbose) {
+          CellBuilder cb;
+          cb.append_cellslice(as_slice());
+          os << cell_to_hex(cb.finalize_novm());
+        } else {
+          static_cast<Ref<CellSlice>>(ref)->dump(os, 1, false);
+        }
+        os << '}';
+      } else {
+        os << "CS{null}";
+      }
       break;
     }
     case t_string:
@@ -137,12 +174,24 @@ void StackEntry::dump(std::ostream& os) const {
       os << "Object{" << (const void*)&*ref << "}";
       break;
     }
+    case t_vmcont: {
+      if (ref.not_null()) {
+        if (verbose) {
+          os << "Cont{" << *as_cont() << "}";
+        } else {
+          os << "Cont{" << as_cont()->type() << "}";
+        }
+      } else {
+        os << "Cont{null}";
+      }
+      break;
+    }
     default:
       os << "???";
   }
 }
 
-void StackEntry::print_list(std::ostream& os) const {
+void StackEntry::print_list(std::ostream& os, bool verbose) const {
   switch (tp) {
     case t_null:
       os << "()";
@@ -151,7 +200,7 @@ void StackEntry::print_list(std::ostream& os) const {
       const auto& tuple = *static_cast<Ref<Tuple>>(ref);
       if (is_list()) {
         os << '(';
-        tuple[0].print_list(os);
+        tuple[0].print_list(os, verbose);
         print_list_tail(os, &tuple[1]);
         break;
       }
@@ -160,7 +209,7 @@ void StackEntry::print_list(std::ostream& os) const {
         os << "[]";
       } else if (n == 1) {
         os << "[";
-        tuple[0].print_list(os);
+        tuple[0].print_list(os, verbose);
         os << "]";
       } else {
         os << "[";
@@ -169,14 +218,14 @@ void StackEntry::print_list(std::ostream& os) const {
           if (c++) {
             os << " ";
           }
-          entry.print_list(os);
+          entry.print_list(os, verbose);
         }
         os << ']';
       }
       break;
     }
     default:
-      dump(os);
+      dump(os, verbose);
   }
 }
 
@@ -314,7 +363,7 @@ void StackEntry::for_each_scalar(const std::function<void(const StackEntry&)>& f
   }
 }
 
-const StackEntry& tuple_index(const Tuple& tup, unsigned idx) {
+const StackEntry& tuple_index(const Ref<Tuple>& tup, unsigned idx) {
   if (idx >= tup->size()) {
     throw VmError{Excno::range_chk, "tuple index out of range"};
   }
@@ -675,12 +724,12 @@ void Stack::dump(std::ostream& os, int mode) const {
   os << " [ ";
   if (mode & 2) {
     for (const auto& x : stack) {
-      x.print_list(os);
+      x.print_list(os, mode & 4);
       os << ' ';
     }
   } else {
     for (const auto& x : stack) {
-      x.dump(os);
+      x.dump(os, mode & 4);
       os << ' ';
     }
   }
@@ -896,23 +945,29 @@ bool Stack::serialize(vm::CellBuilder& cb, int mode) const {
   if (vsi && !vsi->register_op()) {
     return false;
   }
-  // vm_stack#_ depth:(## 24) stack:(VmStackList depth) = VmStack;
-  unsigned n = depth();
-  if (!cb.store_ulong_rchk_bool(n, 24)) {  // vm_stack#_ depth:(## 24)
-    return false;
-  }
-  if (!n) {
-    return true;
-  }
-  vm::CellBuilder cb2;
-  Ref<vm::Cell> rest = cb2.finalize();  // vm_stk_nil#_ = VmStackList 0;
-  for (unsigned i = 0; i < n - 1; i++) {
-    // vm_stk_cons#_ {n:#} rest:^(VmStackList n) tos:VmStackValue = VmStackList (n + 1);
-    if (!(cb2.store_ref_bool(std::move(rest)) && stack[i].serialize(cb2, mode) && cb2.finalize_to(rest))) {
+  try {
+    // vm_stack#_ depth:(## 24) stack:(VmStackList depth) = VmStack;
+    unsigned n = depth();
+    if (!cb.store_ulong_rchk_bool(n, 24)) {  // vm_stack#_ depth:(## 24)
       return false;
     }
+    if (!n) {
+      return true;
+    }
+    vm::CellBuilder cb2;
+    Ref<vm::Cell> rest = cb2.finalize();  // vm_stk_nil#_ = VmStackList 0;
+    for (unsigned i = 0; i < n - 1; i++) {
+      // vm_stk_cons#_ {n:#} rest:^(VmStackList n) tos:VmStackValue = VmStackList (n + 1);
+      if (!(cb2.store_ref_bool(std::move(rest)) && stack[i].serialize(cb2, mode) && cb2.finalize_to(rest))) {
+        return false;
+      }
+    }
+    return cb.store_ref_bool(std::move(rest)) && stack[n - 1].serialize(cb, mode);
+  } catch (CellBuilder::CellCreateError) {
+    return false;
+  } catch (CellBuilder::CellWriteError) {
+    return false;
   }
-  return cb.store_ref_bool(std::move(rest)) && stack[n - 1].serialize(cb, mode);
 }
 
 bool Stack::deserialize(vm::CellSlice& cs, int mode) {
