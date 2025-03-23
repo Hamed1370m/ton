@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
 if (NOT OPENSSL_FOUND)
   find_package(OpenSSL REQUIRED)
 endif()
@@ -21,4 +19,7 @@ add_executable(opcode-timing opcode-timing.cpp )
 target_link_libraries(opcode-timing ton_crypto)
 target_include_directories(pack-viewer PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>/..)
 
-install(TARGETS generate-random-id RUNTIME DESTINATION bin)
+add_executable(proxy-liteserver proxy-liteserver.cpp)
+target_link_libraries(proxy-liteserver tdutils tdactor adnl dht tl_api ton_crypto git lite-client-common)
+
+install(TARGETS generate-random-id proxy-liteserver RUNTIME DESTINATION bin)

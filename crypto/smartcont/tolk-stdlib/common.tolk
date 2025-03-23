@@ -1,7 +1,7 @@
 // Standard library for Tolk (LGPL licence).
 // It contains common functions that are available out of the box, the user doesn't have to import anything.
 // More specific functions are required to be imported explicitly, like "@stdlib/tvm-dicts".
-tolk 0.6
+tolk 0.10
 
 /**
   Tuple manipulation primitives.
@@ -17,33 +17,49 @@ fun createEmptyTuple(): tuple
 /// Appends a value to tuple, resulting in `Tuple t' = (x1, ..., xn, value)`.
 /// If its size exceeds 255, throws a type check exception.
 @pure
-fun tuplePush<X>(mutate self: tuple, value: X): void
+fun tuplePush<T>(mutate self: tuple, value: T): void
     asm "TPUSH";
 
 /// Returns the first element of a non-empty tuple.
+/// `t.0` is actually the same as `t.tupleFirst()`
 @pure
-fun tupleFirst<X>(t: tuple): X
+fun tupleFirst<T>(self: tuple): T
     asm "FIRST";
 
 /// Returns the [`index`]-th element of a tuple.
+/// `t.i` is actually the same as `t.tupleAt(i)`
 @pure
-fun tupleAt<X>(t: tuple, index: int): X
+fun tupleAt<T>(self: tuple, index: int): T
+    builtin;
+
+/// Sets the [`index`]-th element of a tuple to a specified value
+/// (element with this index must already exist, a new element isn't created).
+/// `t.i = value` is actually the same as `t.tupleSetAt(value, i)`
+@pure
+fun tupleSetAt<T>(mutate self: tuple, value: T, index: int): void
     builtin;
 
 /// Returns the size of a tuple (elements count in it).
 @pure
-fun tupleSize(t: tuple): int
+fun tupleSize(self: tuple): int
     asm "TLEN";
 
 /// Returns the last element of a non-empty tuple.
 @pure
-fun tupleLast(t: tuple): int
+fun tupleLast<T>(self: tuple): T
     asm "LAST";
 
 
 /**
     Mathematical primitives.
  */
+
+/// Converts a constant floating-point string to nanotoncoins.
+/// Example: `ton("0.05")` is equal to 50000000.
+/// Note, that `ton()` requires a constant string; `ton(some_var)` is an error
+@pure
+fun ton(floatString: slice): coins
+    builtin;
 
 /// Computes the minimum of two integers.
 @pure
@@ -130,7 +146,7 @@ fun getMyOriginalBalance(): int
 /// `int` — balance in nanotoncoins;
 /// `cell` — a dictionary with 32-bit keys representing the balance of "extra currencies".
 @pure
-fun getMyOriginalBalanceWithExtraCurrencies(): [int, cell]
+fun getMyOriginalBalanceWithExtraCurrencies(): [int, cell?]
     asm "BALANCE";
 
 /// Returns the logical time of the current transaction.
@@ -145,7 +161,7 @@ fun getCurrentBlockLogicalTime(): int
 
 /// Returns the value of the global configuration parameter with integer index `i` as a `cell` or `null` value.
 @pure
-fun getBlockchainConfigParam(x: int): cell
+fun getBlockchainConfigParam(x: int): cell?
     asm "CONFIGOPTPARAM";
 
 /// Returns the persistent contract storage cell. It can be parsed or modified with slice and builder primitives later.
@@ -178,6 +194,42 @@ fun commitContractDataAndActions(): void
   Signature checks, hashing, cryptography.
  */
 
+/// Compile-time function that calculates crc32 of a constant string.
+/// Example: `const op = stringCrc32("some_str")` = 4013618352 = 0xEF3AF4B0
+/// Note: stringCrc32(slice_var) does not work! It accepts a constant string and works at compile-time.
+@pure
+fun stringCrc32(constString: slice): int
+    builtin;
+
+/// Compile-time function that calculates crc16 (XMODEM) of a constant string.
+/// Example: `const op = stringCrc16("some_str")` = 53407 = 0xD09F
+/// Note: stringCrc16(slice_var) does not work! It accepts a constant string and works at compile-time.
+@pure
+fun stringCrc16(constString: slice): int
+    builtin;
+
+/// Compile-time function that calculates sha256 of a constant string and returns 256-bit integer.
+/// Example: `const hash = stringSha256("some_crypto_key")`
+/// Note: it's a compile-time function, `stringSha256(slice_var)` does not work.
+/// Use `sliceBitsHash` or `sliceHash` (declared below) to hash a slice without/with its refs at runtime.
+@pure
+fun stringSha256(constString: slice): int
+    builtin;
+
+/// Compile-time function that calculates sha256 of a constant string and takes the first 32 bits.
+/// Example: `const minihash = stringSha256_32("some_crypto_key")`
+/// Note: stringSha256_32(slice_var) does not work! It accepts a constant string and works at compile-time.
+@pure
+fun stringSha256_32(constString: slice): int
+    builtin;
+
+/// Compile-time function that takes N-chars ascii string and interprets it as a number in base 256.
+/// Example: `const value = stringToBase256("AB")` = 16706 (65*256 + 66)
+/// Note: stringToBase256(slice_var) does not work! It accepts a constant string and works at compile-time.
+@pure
+fun stringToBase256(constString: slice): int
+    builtin;
+
 /// Computes the representation hash of a `cell` [c] and returns it as a 256-bit unsigned integer `x`.
 /// Useful for signing and checking signatures of arbitrary entities represented by a tree of cells.
 @pure
@@ -194,7 +246,7 @@ fun sliceHash(s: slice): int
 /// Computes sha256 of the data bits of `slice` [s]. If the bit length of `s` is not divisible by eight,
 /// throws a cell underflow exception. The hash value is returned as a 256-bit unsigned integer `x`.
 @pure
-fun stringHash(s: slice): int
+fun sliceBitsHash(s: slice): int
     asm "SHA256U";
 
 /// Checks the Ed25519-`signature` of a `hash` (a 256-bit unsigned integer, usually computed as the hash of some data)
@@ -205,7 +257,7 @@ fun stringHash(s: slice): int
 /// That is, if [hash] is computed as the hash of some data, these data are hashed twice,
 /// the second hashing occurring inside `CHKSIGNS`.
 @pure
-fun isSignatureValid(hash: int, signature: slice, publicKey: int): int
+fun isSignatureValid(hash: int, signature: slice, publicKey: int): bool
     asm "CHKSIGNU";
 
 /// Checks whether [signature] is a valid Ed25519-signature of the data portion of `slice data` using `publicKey`,
@@ -214,7 +266,7 @@ fun isSignatureValid(hash: int, signature: slice, publicKey: int): int
 /// The verification of Ed25519 signatures is the standard one,
 /// with sha256 used to reduce [data] to the 256-bit number that is actually signed.
 @pure
-fun isSliceSignatureValid(data: slice, signature: slice, publicKey: int): int
+fun isSliceSignatureValid(data: slice, signature: slice, publicKey: int): bool
     asm "CHKSIGNS";
 
 /// Generates a new pseudo-random unsigned 256-bit integer x.
@@ -259,14 +311,14 @@ fun randomizeByLogicalTime(): void
 /// otherwise the computation is aborted before visiting the `(maxCells + 1)`-st cell and
 /// a zero flag is returned to indicate failure. If [c] is `null`, returns `x = y = z = 0`.
 @pure
-fun calculateCellSize(c: cell, maxCells: int): (int, int, int, int)
+fun calculateCellSize(c: cell, maxCells: int): (int, int, int, bool)
     asm "CDATASIZEQ NULLSWAPIFNOT2 NULLSWAPIFNOT";
 
 /// Similar to [calculateCellSize], but accepting a `slice` [s] instead of a `cell`.
 /// The returned value of `x` does not take into account the cell that contains the `slice` [s] itself;
 /// however, the data bits and the cell references of [s] are accounted for in `y` and `z`.
 @pure
-fun calculateSliceSize(s: slice, maxCells: int): (int, int, int, int)
+fun calculateSliceSize(s: slice, maxCells: int): (int, int, int, bool)
     asm "SDATASIZEQ NULLSWAPIFNOT2 NULLSWAPIFNOT";
 
 /// A non-quiet version of [calculateCellSize] that throws a cell overflow exception (`8`) on failure.
@@ -282,7 +334,7 @@ fun calculateSliceSizeStrict(s: slice, maxCells: int): (int, int, int)
 /// otherwise the returned value is one plus the maximum of depths of cells referred to from [c].
 /// If [c] is a `null` instead of a cell, returns zero.
 @pure
-fun getCellDepth(c: cell): int
+fun getCellDepth(c: cell?): int
     asm "CDEPTH";
 
 /// Returns the depth of `slice` [s].
@@ -306,11 +358,11 @@ fun getBuilderDepth(b: builder): int
  */
 
 /// Dump a variable [x] to the debug log.
-fun debugPrint<X>(x: X): void
+fun debugPrint<T>(x: T): void
     builtin;
 
 /// Dump a string [x] to the debug log.
-fun debugPrintString<X>(x: X): void
+fun debugPrintString<T>(x: T): void
     builtin;
 
 /// Dumps the stack (at most the top 255 values) and shows the total stack depth.
@@ -323,6 +375,22 @@ fun debugDumpStack(): void
   When you _load_ some data, you mutate the slice (shifting an internal pointer on the stack).
   When you _preload_ some data, you just get the result without mutating the slice.
  */
+
+/// Compile-time function that converts a constant string to TL-encoded MsgAddressInt (TVM slice).
+/// Example: stringAddressToSlice("EQCRDM9h4k3UJdOePPuyX40mCgA4vxge5Dc5vjBR8djbEKC5")
+/// Example: stringAddressToSlice("0:527964d55cfa6eb731f4bfc07e9d025098097ef8505519e853986279bd8400d8")
+/// Note: it's a compile-time function, `stringAddressToSlice(slice_var)` does not work.
+/// Use `parseStandardAddress` to decode a slice at runtime into workchain and hash.
+@pure
+fun stringAddressToSlice(constStringAddress: slice): slice
+    builtin;
+
+/// Compile-time function that converts a constant hex-encoded string to N/2 bytes.
+/// Example: `const v = stringHexToSlice("abcdef")` = slice with 3 bytes `[ 0xAB, 0xCD, 0xEF ]`
+/// Note: stringHexToSlice(slice_var) does not work! It accepts a constant string and works at compile-time.
+@pure
+fun stringHexToSlice(constStringBytesHex: slice): slice
+    builtin;
 
 /// Converts a `cell` [c] into a `slice`. Notice that [c] must be either an ordinary cell,
 /// or an exotic cell (see [TVM.pdf](https://ton-blockchain.github.io/docs/tvm.pdf), 3.1.2)
@@ -377,12 +445,12 @@ fun preloadBits(self: slice, len: int): slice
 
 /// Loads serialized amount of Toncoins (any unsigned integer up to `2^120 - 1`).
 @pure
-fun loadCoins(mutate self: slice): int
+fun loadCoins(mutate self: slice): coins
     asm( -> 1 0) "LDGRAMS";
 
 /// Loads bool (-1 or 0) from a slice
 @pure
-fun loadBool(mutate self: slice): int
+fun loadBool(mutate self: slice): bool
     asm( -> 1 0) "1 LDI";
 
 /// Shifts a slice pointer to [len] bits forward, mutating the slice.
@@ -408,12 +476,12 @@ fun getLastBits(self: slice, len: int): slice
 /// Loads a dictionary (TL HashMapE structure, represented as TVM cell) from a slice.
 /// Returns `null` if `nothing` constructor is used.
 @pure
-fun loadDict(mutate self: slice): cell
+fun loadDict(mutate self: slice): cell?
     asm( -> 1 0) "LDDICT";
 
 /// Preloads a dictionary (cell) from a slice.
 @pure
-fun preloadDict(self: slice): cell
+fun preloadDict(self: slice): cell?
     asm "PLDDICT";
 
 /// Loads a dictionary as [loadDict], but returns only the remainder of the slice.
@@ -424,12 +492,12 @@ fun skipDict(mutate self: slice): self
 /// Loads (Maybe ^Cell) from a slice.
 /// In other words, loads 1 bit: if it's true, loads the first ref, otherwise returns `null`.
 @pure
-fun loadMaybeRef(mutate self: slice): cell
+fun loadMaybeRef(mutate self: slice): cell?
     asm( -> 1 0) "LDOPTREF";
 
 /// Preloads (Maybe ^Cell) from a slice.
 @pure
-fun preloadMaybeRef(self: slice): cell
+fun preloadMaybeRef(self: slice): cell?
     asm "PLDOPTREF";
 
 /// Loads (Maybe ^Cell), but returns only the remainder of the slice.
@@ -476,25 +544,25 @@ fun storeSlice(mutate self: builder, s: slice): self
 
 /// Stores amount of Toncoins into a builder.
 @pure
-fun storeCoins(mutate self: builder, x: int): self
+fun storeCoins(mutate self: builder, x: coins): self
     asm "STGRAMS";
 
 /// Stores bool (-1 or 0) into a builder.
 /// Attention: true value is `-1`, not 1! If you pass `1` here, TVM will throw an exception.
 @pure
-fun storeBool(mutate self: builder, x: int): self
+fun storeBool(mutate self: builder, x: bool): self
     asm(x self) "1 STI";
 
 /// Stores dictionary (represented by TVM `cell` or `null`) into a builder.
 /// In other words, stores a `1`-bit and a reference to [c] if [c] is not `null` and `0`-bit otherwise.
 @pure
-fun storeDict(mutate self: builder, c: cell): self
+fun storeDict(mutate self: builder, c: cell?): self
     asm(c self) "STDICT";
 
 /// Stores (Maybe ^Cell) into a builder.
 /// In other words, if cell is `null`, store '0' bit; otherwise, store '1' and a ref to [c].
 @pure
-fun storeMaybeRef(mutate self: builder, c: cell): self
+fun storeMaybeRef(mutate self: builder, c: cell?): self
     asm(c self) "STOPTREF";
 
 /// Concatenates two builders.
@@ -529,22 +597,22 @@ fun getRemainingBitsAndRefsCount(self: slice): (int, int)
 
 /// Checks whether a slice is empty (i.e., contains no bits of data and no cell references).
 @pure
-fun isEndOfSlice(self: slice): int
+fun isEndOfSlice(self: slice): bool
     asm "SEMPTY";
 
 /// Checks whether a slice has no bits of data.
 @pure
-fun isEndOfSliceBits(self: slice): int
+fun isEndOfSliceBits(self: slice): bool
     asm "SDEMPTY";
 
 /// Checks whether a slice has no references.
 @pure
-fun isEndOfSliceRefs(self: slice): int
+fun isEndOfSliceRefs(self: slice): bool
     asm "SREMPTY";
 
 /// Checks whether data parts of two slices coinside.
 @pure
-fun isSliceBitsEqual(self: slice, b: slice): int
+fun isSliceBitsEqual(self: slice, b: slice): bool
     asm "SDEQ";
 
 /// Returns the number of cell references already stored in a builder.
@@ -621,10 +689,10 @@ fun parseStandardAddress(s: slice): (int, int)
 fun createAddressNone(): slice
     asm "b{00} PUSHSLICE";
 
-/// Returns if a slice pointer contains an empty address (`-1` for true, `0` for false, as always).
+/// Returns if a slice pointer contains an empty address.
 /// In other words, a slice starts with two `0` bits (TL addr_none$00).
 @pure
-fun addressIsNone(s: slice): int
+fun addressIsNone(s: slice): bool
     asm "2 PLDU" "0 EQINT";
 
 
@@ -652,7 +720,7 @@ fun reserveToncoinsOnBalance(nanoTonCoins: int, reserveMode: int): void
 
 /// Similar to [reserveToncoinsOnBalance], but also accepts a dictionary extraAmount (represented by a cell or null)
 /// with extra currencies. In this way currencies other than Toncoin can be reserved.
-fun reserveExtraCurrenciesOnBalance(nanoTonCoins: int, extraAmount: cell, reserveMode: int): void
+fun reserveExtraCurrenciesOnBalance(nanoTonCoins: int, extraAmount: cell?, reserveMode: int): void
     asm "RAWRESERVEX";
 
 
@@ -677,8 +745,8 @@ fun loadMessageFlags(mutate self: slice): int
 /// Having msgFlags (4 bits), check that a message is bounced.
 /// Effectively, it's `msgFlags & 1` (the lowest bit present).
 @pure
-fun isMessageBounced(msgFlags: int): int
-    asm "1 PUSHINT" "AND";
+fun isMessageBounced(msgFlags: int): bool
+    asm "2 PUSHINT" "MODR";
 
 /// Skip 0xFFFFFFFF prefix (when a message is bounced).
 @pure

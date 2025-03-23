@@ -63,7 +63,7 @@ td::actor::ActorOwn<Overlay> Overlay::create_private(
   return td::actor::create_actor<OverlayImpl>(
       overlay_actor_name(overlay_id), keyring, adnl, manager, dht_node, local_id, std::move(overlay_id),
       OverlayType::FixedMemberList, std::move(nodes), std::vector<PublicKeyHash>(), OverlayMemberCertificate{},
-      std::move(callback), std::move(rules), std::move(scope));
+      std::move(callback), std::move(rules), std::move(scope), std::move(opts));
 }
 
 td::actor::ActorOwn<Overlay> Overlay::create_semiprivate(
@@ -99,6 +99,7 @@ OverlayImpl::OverlayImpl(td::actor::ActorId<keyring::Keyring> keyring, td::actor
   overlay_id_ = id_full_.compute_short_id();
   frequent_dht_lookup_ = opts_.frequent_dht_lookup_;
   peer_list_.local_member_flags_ = opts_.local_overlay_member_flags_;
+  opts_.broadcast_speed_multiplier_ = std::max(opts_.broadcast_speed_multiplier_, 1e-9);
 
   VLOG(OVERLAY_INFO) << this << ": creating";
 
@@ -347,7 +348,12 @@ void OverlayImpl::alarm() {
       update_db_at_ = td::Timestamp::in(60.0);
     }
 
-    update_neighbours(0);
+    if (update_neighbours_at_.is_in_past()) {
+      update_neighbours(2);
+      update_neighbours_at_ = td::Timestamp::in(td::Random::fast(30.0, 120.0));
+    } else {
+      update_neighbours(0);
+    }
     alarm_timestamp() = td::Timestamp::in(1.0);
   } else {
     update_neighbours(0);
@@ -485,7 +491,8 @@ void OverlayImpl::send_broadcast_fec(PublicKeyHash send_as, td::uint32 flags, td
     VLOG(OVERLAY_WARNING) << "broadcast source certificate is invalid";
     return;
   }
-  OverlayOutboundFecBroadcast::create(std::move(data), flags, actor_id(this), send_as);
+  OverlayOutboundFecBroadcast::create(std::move(data), flags, actor_id(this), send_as,
+                                      opts_.broadcast_speed_multiplier_);
 }
 
 void OverlayImpl::print(td::StringBuilder &sb) {
@@ -503,37 +510,44 @@ td::Status OverlayImpl::check_date(td::uint32 date) {
   return td::Status::OK();
 }
 
-BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash &source, const Certificate *cert,
+BroadcastCheckResult OverlayImpl::check_source_eligible(const PublicKeyHash& source, const Certificate* cert,
                                                         td::uint32 size, bool is_fec) {
   if (size == 0) {
     return BroadcastCheckResult::Forbidden;
   }
-
   auto r = rules_.check_rules(source, size, is_fec);
   if (!cert || r == BroadcastCheckResult::Allowed) {
     return r;
   }
+  td::Bits256 cert_hash = get_tl_object_sha_bits256(cert->tl());
+  auto cached_cert = checked_certificates_cache_.find(source);
+  bool cached = cached_cert != checked_certificates_cache_.end() && cached_cert->second->cert_hash == cert_hash;
 
-  auto r2 = cert->check(source, overlay_id_, static_cast<td::int32>(td::Clocks::system()), size, is_fec);
+  auto r2 = cert->check(source, overlay_id_, static_cast<td::int32>(td::Clocks::system()), size, is_fec,
+                        /* skip_check_signature = */ cached);
+  if (r2 != BroadcastCheckResult::Forbidden) {
+    if (cached_cert == checked_certificates_cache_.end()) {
+      cached_cert = checked_certificates_cache_.emplace(
+          source, std::make_unique<CachedCertificate>(source, cert_hash)).first;
+    } else {
+      cached_cert->second->cert_hash = cert_hash;
+      cached_cert->second->remove();
+    }
+    checked_certificates_cache_lru_.put(cached_cert->second.get());
+    while (checked_certificates_cache_.size() > max_checked_certificates_cache_size_) {
+      auto to_remove = (CachedCertificate*)checked_certificates_cache_lru_.get();
+      CHECK(to_remove);
+      to_remove->remove();
+      checked_certificates_cache_.erase(to_remove->source);
+    }
+  }
   r2 = broadcast_check_result_min(r2, rules_.check_rules(cert->issuer_hash(), size, is_fec));
   return broadcast_check_result_max(r, r2);
 }
 
-BroadcastCheckResult OverlayImpl::check_source_eligible(PublicKey source, const Certificate *cert, td::uint32 size,
+BroadcastCheckResult OverlayImpl::check_source_eligible(PublicKey source, const Certificate* cert, td::uint32 size,
                                                         bool is_fec) {
-  if (size == 0) {
-    return BroadcastCheckResult::Forbidden;
-  }
-  auto short_id = source.compute_short_id();
-
-  auto r = rules_.check_rules(short_id, size, is_fec);
-  if (!cert || r == BroadcastCheckResult::Allowed) {
-    return r;
-  }
-
-  auto r2 = cert->check(short_id, overlay_id_, static_cast<td::int32>(td::Clocks::system()), size, is_fec);
-  r2 = broadcast_check_result_min(r2, rules_.check_rules(cert->issuer_hash(), size, is_fec));
-  return broadcast_check_result_max(r, r2);
+  return check_source_eligible(source.compute_short_id(), cert, size, is_fec);
 }
 
 td::Status OverlayImpl::check_delivered(BroadcastHash hash) {

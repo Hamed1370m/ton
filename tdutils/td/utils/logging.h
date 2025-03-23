@@ -74,6 +74,7 @@
 
 #define LOG(level) LOG_IMPL(level, level, true, ::td::Slice())
 #define LOG_IF(level, condition) LOG_IMPL(level, level, condition, #condition)
+#define FLOG(level) LOG_IMPL(level, level, true, ::td::Slice()) << td::LambdaPrint{} << [&](auto &sb)
 
 #define VLOG(level) LOG_IMPL(DEBUG, level, true, TD_DEFINE_STR(level))
 #define VLOG_IF(level, condition) LOG_IMPL(DEBUG, level, condition, TD_DEFINE_STR(level) " " #condition)
@@ -95,13 +96,13 @@ inline bool no_return_func() {
 #define DUMMY_LOG_CHECK(condition) LOG_IF(NEVER, !(condition))
 
 #ifdef TD_DEBUG
-  #if TD_MSVC
+#if TD_MSVC
     #define LOG_CHECK(condition)        \
       __analysis_assume(!!(condition)); \
       LOG_IMPL(FATAL, FATAL, !(condition), #condition)
-  #else
+#else
     #define LOG_CHECK(condition) LOG_IMPL(FATAL, FATAL, !(condition) && no_return_func(), #condition)
-  #endif
+#endif
 #else
   #define LOG_CHECK DUMMY_LOG_CHECK
 #endif
@@ -263,6 +264,9 @@ class Logger {
     sb_ << other;
     return *this;
   }
+  LambdaPrintHelper<td::StringBuilder> operator<<(const LambdaPrint &) {
+    return LambdaPrintHelper<td::StringBuilder>{sb_};
+  }
 
   MutableCSlice as_cslice() {
     return sb_.as_cslice();
@@ -339,7 +343,10 @@ class TsLog : public LogInterface {
 
  private:
   LogInterface *log_ = nullptr;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-pragma"
   std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
+#pragma clang diagnostic pop
   void enter_critical() {
     while (lock_.test_and_set(std::memory_order_acquire)) {
       // spin

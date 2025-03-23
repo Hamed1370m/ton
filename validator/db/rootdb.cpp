@@ -347,7 +347,8 @@ void RootDb::try_get_static_file(FileHash file_hash, td::Promise<td::BufferSlice
 }
 
 void RootDb::apply_block(BlockHandle handle, td::Promise<td::Unit> promise) {
-  td::actor::create_actor<BlockArchiver>("archiver", std::move(handle), archive_db_.get(), std::move(promise))
+  td::actor::create_actor<BlockArchiver>("archiver", std::move(handle), archive_db_.get(), actor_id(this),
+                                         std::move(promise))
       .release();
 }
 
@@ -421,7 +422,8 @@ void RootDb::start_up() {
 }
 
 void RootDb::archive(BlockHandle handle, td::Promise<td::Unit> promise) {
-  td::actor::create_actor<BlockArchiver>("archiveblock", std::move(handle), archive_db_.get(), std::move(promise))
+  td::actor::create_actor<BlockArchiver>("archiveblock", std::move(handle), archive_db_.get(), actor_id(this),
+                                         std::move(promise))
       .release();
 }
 
@@ -436,6 +438,7 @@ void RootDb::allow_block_gc(BlockIdExt block_id, td::Promise<bool> promise) {
 void RootDb::prepare_stats(td::Promise<std::vector<std::pair<std::string, std::string>>> promise) {
   auto merger = StatsMerger::create(std::move(promise));
   td::actor::send_closure(cell_db_, &CellDb::prepare_stats, merger.make_promise("celldb."));
+  td::actor::send_closure(archive_db_, &ArchiveManager::prepare_stats, merger.make_promise("archive."));
 }
 
 void RootDb::truncate(BlockSeqno seqno, ConstBlockHandle handle, td::Promise<td::Unit> promise) {
@@ -501,8 +504,9 @@ void RootDb::check_key_block_proof_link_exists(BlockIdExt block_id, td::Promise<
                           std::move(P));
 }
 
-void RootDb::get_archive_id(BlockSeqno masterchain_seqno, td::Promise<td::uint64> promise) {
-  td::actor::send_closure(archive_db_, &ArchiveManager::get_archive_id, masterchain_seqno, std::move(promise));
+void RootDb::get_archive_id(BlockSeqno masterchain_seqno, ShardIdFull shard_prefix, td::Promise<td::uint64> promise) {
+  td::actor::send_closure(archive_db_, &ArchiveManager::get_archive_id, masterchain_seqno, shard_prefix,
+                          std::move(promise));
 }
 
 void RootDb::get_archive_slice(td::uint64 archive_id, td::uint64 offset, td::uint32 limit,
@@ -517,6 +521,14 @@ void RootDb::set_async_mode(bool mode, td::Promise<td::Unit> promise) {
 
 void RootDb::run_gc(UnixTime mc_ts, UnixTime gc_ts, UnixTime archive_ttl) {
   td::actor::send_closure(archive_db_, &ArchiveManager::run_gc, mc_ts, gc_ts, archive_ttl);
+}
+
+void RootDb::add_persistent_state_description(td::Ref<PersistentStateDescription> desc, td::Promise<td::Unit> promise) {
+  td::actor::send_closure(state_db_, &StateDb::add_persistent_state_description, std::move(desc), std::move(promise));
+}
+
+void RootDb::get_persistent_state_descriptions(td::Promise<std::vector<td::Ref<PersistentStateDescription>>> promise) {
+  td::actor::send_closure(state_db_, &StateDb::get_persistent_state_descriptions, std::move(promise));
 }
 
 }  // namespace validator

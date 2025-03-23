@@ -1,5 +1,3 @@
-cmake_minimum_required(VERSION 3.5 FATAL_ERROR)
-
 if (NOT OPENSSL_FOUND)
   find_package(OpenSSL REQUIRED)
 endif()
@@ -46,6 +44,7 @@ set(VALIDATOR_HEADERS
   interfaces/db.h
   interfaces/external-message.h
   interfaces/liteserver.h
+  interfaces/out-msg-queue-proof.h
   interfaces/proof.h
   interfaces/shard.h
   interfaces/signature-set.h
@@ -56,6 +55,7 @@ set(VALIDATOR_HEADERS
   
   import-db-slice.hpp
   queue-size-counter.hpp
+  validator-telemetry.hpp
 
   manager-disk.h
   manager-disk.hpp
@@ -82,6 +82,7 @@ set(VALIDATOR_SOURCE
   validator-group.cpp
   validator-options.cpp
   queue-size-counter.cpp
+  validator-telemetry.cpp
 
   downloaders/wait-block-data.cpp
   downloaders/wait-block-state.cpp

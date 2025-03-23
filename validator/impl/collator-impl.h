@@ -50,7 +50,7 @@ class Collator final : public td::actor::Actor {
   using LtCellRef = block::LtCellRef;
   using NewOutMsg = block::NewOutMsg;
   const ShardIdFull shard_;
-  ton::BlockId new_id;
+  ton::BlockId new_id{workchainInvalid, 0, 0};
   bool busy_{false};
   bool before_split_{false};
   bool after_split_{false};
@@ -109,14 +109,11 @@ class Collator final : public td::actor::Actor {
     return 2;
   }
 
-  static td::Result<std::unique_ptr<block::transaction::Transaction>>
-                        impl_create_ordinary_transaction(Ref<vm::Cell> msg_root,
-                                                         block::Account* acc,
-                                                         UnixTime utime, LogicalTime lt,
-                                                         block::StoragePhaseConfig* storage_phase_cfg,
-                                                         block::ComputePhaseConfig* compute_phase_cfg,
-                                                         block::ActionPhaseConfig* action_phase_cfg,
-                                                         bool external, LogicalTime after_lt);
+  static td::Result<std::unique_ptr<block::transaction::Transaction>> impl_create_ordinary_transaction(
+      Ref<vm::Cell> msg_root, block::Account* acc, UnixTime utime, LogicalTime lt,
+      block::StoragePhaseConfig* storage_phase_cfg, block::ComputePhaseConfig* compute_phase_cfg,
+      block::ActionPhaseConfig* action_phase_cfg, block::SerializeConfig* serialize_cfg, bool external,
+      LogicalTime after_lt);
 
  private:
   void start_up() override;
@@ -177,9 +174,11 @@ class Collator final : public td::actor::Actor {
   block::StoragePhaseConfig storage_phase_cfg_{&storage_prices_};
   block::ComputePhaseConfig compute_phase_cfg_;
   block::ActionPhaseConfig action_phase_cfg_;
+  block::SerializeConfig serialize_cfg_;
   td::RefInt256 masterchain_create_fee_, basechain_create_fee_;
   std::unique_ptr<block::BlockLimits> block_limits_;
   std::unique_ptr<block::BlockLimitStatus> block_limit_status_;
+  int block_limit_class_ = 0;
   ton::LogicalTime min_new_msg_lt{std::numeric_limits<td::uint64>::max()};
   block::CurrencyCollection total_balance_, old_total_balance_, total_validator_fees_;
   block::CurrencyCollection global_balance_, old_global_balance_, import_created_{0};

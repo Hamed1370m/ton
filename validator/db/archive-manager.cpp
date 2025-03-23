@@ -624,7 +624,7 @@ void ArchiveManager::load_package(PackageId id) {
     }
   }
 
-  desc.file = td::actor::create_actor<ArchiveSlice>("slice", id.id, id.key, id.temp, false, db_root_,
+  desc.file = td::actor::create_actor<ArchiveSlice>("slice", id.id, id.key, id.temp, false, 0, db_root_,
                                                     archive_lru_.get(), statistics_);
 
   m.emplace(id, std::move(desc));
@@ -659,7 +659,8 @@ const ArchiveManager::FileDescription *ArchiveManager::add_file_desc(ShardIdFull
   FileDescription new_desc{id, false};
   td::mkdir(db_root_ + id.path()).ensure();
   std::string prefix = PSTRING() << db_root_ << id.path() << id.name();
-  new_desc.file = td::actor::create_actor<ArchiveSlice>("slice", id.id, id.key, id.temp, false, db_root_,
+  new_desc.file = td::actor::create_actor<ArchiveSlice>("slice", id.id, id.key, id.temp, false,
+                                                        id.key || id.temp ? 0 : cur_shard_split_depth_, db_root_,
                                                         archive_lru_.get(), statistics_);
   const FileDescription &desc = f.emplace(id, std::move(new_desc));
   if (!id.temp) {
@@ -1132,14 +1133,16 @@ PackageId ArchiveManager::get_package_id_force(BlockSeqno masterchain_seqno, Sha
   return it->first;
 }
 
-void ArchiveManager::get_archive_id(BlockSeqno masterchain_seqno, td::Promise<td::uint64> promise) {
+void ArchiveManager::get_archive_id(BlockSeqno masterchain_seqno, ShardIdFull shard_prefix,
+                                    td::Promise<td::uint64> promise) {
   auto F = get_file_desc_by_seqno(ShardIdFull{masterchainId}, masterchain_seqno, false);
   if (!F) {
     promise.set_error(td::Status::Error(ErrorCode::notready, "archive not found"));
     return;
   }
 
-  td::actor::send_closure(F->file_actor_id(), &ArchiveSlice::get_archive_id, masterchain_seqno, std::move(promise));
+  td::actor::send_closure(F->file_actor_id(), &ArchiveSlice::get_archive_id, masterchain_seqno, shard_prefix,
+                          std::move(promise));
 }
 
 void ArchiveManager::get_archive_slice(td::uint64 archive_id, td::uint64 offset, td::uint32 limit,
@@ -1191,6 +1194,30 @@ void ArchiveManager::set_async_mode(bool mode, td::Promise<td::Unit> promise) {
       td::actor::send_closure(x.second.file_actor_id(), &ArchiveSlice::set_async_mode, mode, ig.get_promise());
     }
   }
+}
+
+void ArchiveManager::prepare_stats(td::Promise<std::vector<std::pair<std::string, std::string>>> promise) {
+  std::vector<std::pair<std::string, std::string>> stats;
+  {
+    std::map<BlockSeqno, td::uint64> states;
+    for (auto &[key, file] : perm_states_) {
+      BlockSeqno seqno = key.first;
+      auto r_stat = td::stat(db_root_ + "/archive/states/" + file.filename_short());
+      if (r_stat.is_error()) {
+        LOG(WARNING) << "Cannot stat persistent state file " << file.filename_short() << " : " << r_stat.move_as_error();
+      } else {
+        states[seqno] += r_stat.move_as_ok().size_;
+      }
+    }
+    td::StringBuilder sb;
+    for (auto &[seqno, size] : states) {
+      sb << seqno << ":" << td::format::as_size(size) << " ";
+    }
+    if (!sb.as_cslice().empty()) {
+      stats.emplace_back("persistent_states", sb.as_cslice().str());
+    }
+  }
+  promise.set_value(std::move(stats));
 }
 
 void ArchiveManager::truncate(BlockSeqno masterchain_seqno, ConstBlockHandle handle, td::Promise<td::Unit> promise) {
