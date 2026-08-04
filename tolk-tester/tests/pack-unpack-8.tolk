@@ -60,12 +60,12 @@ enum EOfCrc32: uint32 {
 }
 
 enum Amounts: coins {
-    zero = ton("0"),
-    nanoton = 1,
-    small = ton("0.0001"),
-    more = ton("0.05"),
+    zero = grams("0"),
+    nanogram = 1,
+    small = grams("0.0001"),
+    more = grams("0.05"),
     more1,
-    one = ton("1"),
+    one = grams("1"),
 }
 
 
@@ -137,7 +137,7 @@ fun test9() {
 fun test10() {
     var w1 = WithEnumsUnion{u: EFits8Bits.E110}.toCell().load();
     var w2 = WithEnumsUnion{u: (220 as EFits8Bits)}.toCell().load();
-    var w3 = WithEnumsUnion{u: ([0] as tuple).get<EStartFromM2>(0)}.toCell().load();
+    var w3 = WithEnumsUnion{u: ([0] as [EStartFromM2]).0}.toCell().load();
     var w4 = WithEnumsUnion{u: EStartFromM2.P3}.toCell().load();
     return (
         w1.u is EFits8Bits && w1.u == EFits8Bits.E110,
@@ -152,7 +152,9 @@ fun test10() {
 fun test11() {
     var (r1, r2) = (-1 as Role, -1 as Role);
     val before = (r1 == Role.Admin, r2 == Role.Admin);
-    (r1, r2).decode(stringHexToSlice("0001"));
+    var roles = (r1, r2);
+    roles.decode(stringHexToSlice("0001"));
+    (r1, r2) = roles;
     return (before, r1, r2, r1 == Role.Admin, r2 == Role.Admin, r1 == Role.User, r2 == Role.User)
 }
 
@@ -182,11 +184,30 @@ fun test14() {
         beginCell().storeAny(Amounts.zero).bitsCount(),
         beginCell().storeAny(Amounts.more).bitsCount(),
         Amounts.fromSlice(stringHexToSlice("402faf080")) as int64,
-        Amounts.fromSlice(stringHexToSlice("402faf080")) as coins == ton("0.05"),
+        Amounts.fromSlice(stringHexToSlice("402faf080")) as coins == grams("0.05"),
         Amounts.fromSlice(stringHexToSlice("402faf080")) == Amounts.more,
         Amounts.more1,
         ex,
     )
+}
+
+type Byte = uint8
+
+fun Byte.packToBuilder(self, mutate b: builder) {
+    b.storeUint(self, 8);
+}
+
+fun Byte.unpackFromSlice(mutate s: slice) {
+    return s.loadUint(8) as uint8;
+}
+
+@method_id(115)
+fun test15(): int {
+    try {
+        return Role.fromCell(beginCell().storeUint(111, 8).endCell());
+    } catch (ex) {
+        return ex;
+    }
 }
 
 fun main() {
@@ -216,6 +237,7 @@ fun main() {
 @testcase | 112 |               | 1 0 -1
 @testcase | 113 |               | 980881731 -1
 @testcase | 114 |               | -1 -1 4 36 50000000 -1 -1 50000001 5
+@testcase | 115 |               | 5
 
 @fif_codegen
 """
@@ -242,7 +264,6 @@ fun main() {
 @fif_codegen
 """
   test5() PROC:<{
-    // s
     3 PLDI
     DUP
     -2 LESSINT

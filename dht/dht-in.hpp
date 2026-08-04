@@ -18,10 +18,12 @@
 */
 #pragma once
 
-#include "dht.hpp"
+#include <map>
+
+#include "td/actor/SharedFuture.h"
 #include "td/db/KeyValueAsync.h"
 
-#include <map>
+#include "dht.hpp"
 
 namespace ton {
 
@@ -112,6 +114,8 @@ class DhtMemberImpl : public DhtMember {
   DbType db_;
   td::Timestamp next_save_to_db_at_ = td::Timestamp::in(10.0);
 
+  std::shared_ptr<td::actor::SharedFuture<DhtNode>> self_node_future_;
+
   void save_to_db();
 
   DhtNodesList get_nearest_nodes(DhtKeyId id, td::uint32 k);
@@ -189,6 +193,8 @@ class DhtMemberImpl : public DhtMember {
   }
 
   void get_self_node(td::Promise<DhtNode> promise) override;
+  td::actor::Task<DhtNode> get_self_node_coro();
+  td::actor::Task<DhtNode> get_self_node_inner();
 
   static constexpr size_t MAX_VALUES = 100000;
   static constexpr size_t MAX_REVERSE_CONNECTIONS = 100000;

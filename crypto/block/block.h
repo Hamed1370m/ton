@@ -17,18 +17,21 @@
     Copyright 2017-2020 Telegram Systems LLP
 */
 #pragma once
+#include <ostream>
+
 #include "common/refcnt.hpp"
+#include "td/utils/CancellationToken.h"
+#include "td/utils/StringBuilder.h"
+#include "td/utils/bits.h"
+#include "tl/tlblib.hpp"
+#include "ton/ton-types.h"
+#include "vm/boc.h"
 #include "vm/cells.h"
 #include "vm/cellslice.h"
 #include "vm/dict.h"
-#include "vm/boc.h"
 #include "vm/stack.hpp"
-#include <ostream>
-#include "tl/tlblib.hpp"
-#include "td/utils/bits.h"
-#include "td/utils/CancellationToken.h"
-#include "td/utils/StringBuilder.h"
-#include "ton/ton-types.h"
+
+#include "signature-set.h"
 
 namespace block {
 
@@ -589,9 +592,7 @@ struct BlockProofLink {
   ton::BlockIdExt from, to;
   bool is_key{false}, is_fwd{false};
   Ref<vm::Cell> dest_proof, state_proof, proof;
-  ton::CatchainSeqno cc_seqno{0};
-  td::uint32 validator_set_hash{0};
-  std::vector<ton::BlockSignature> signatures;
+  Ref<BlockSignatureSet> sig_set;
   BlockProofLink(ton::BlockIdExt _from, ton::BlockIdExt _to, bool _iskey = false)
       : from(_from), to(_to), is_key(_iskey), is_fwd(to.seqno() > from.seqno()) {
   }
@@ -736,6 +737,13 @@ td::Status unpack_block_prev_blk_ext(Ref<vm::Cell> block_root, const ton::BlockI
 td::Status unpack_block_prev_blk_try(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
                                      std::vector<ton::BlockIdExt>& prev, ton::BlockIdExt& mc_blkid, bool& after_split,
                                      ton::BlockIdExt* fetch_blkid = nullptr);
+struct BlockHeaderInfo {
+  std::vector<ton::BlockIdExt> prev;
+  ton::BlockIdExt mc_blkid;
+  bool after_split;
+};
+td::Result<BlockHeaderInfo> get_block_header_info(Ref<vm::Cell> block_root, const ton::BlockIdExt& id);
+
 td::Status check_block_header(Ref<vm::Cell> block_root, const ton::BlockIdExt& id,
                               ton::Bits256* store_shard_hash_to = nullptr);
 

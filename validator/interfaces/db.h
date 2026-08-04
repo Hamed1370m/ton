@@ -34,9 +34,10 @@ class Db : public td::actor::Actor {
   virtual void store_block_data(BlockHandle handle, td::Ref<BlockData> data, td::Promise<td::Unit> promise) = 0;
   virtual void get_block_data(ConstBlockHandle handle, td::Promise<td::Ref<BlockData>> promise) = 0;
 
-  virtual void store_block_signatures(BlockHandle handle, td::Ref<BlockSignatureSet> data,
-                                      td::Promise<td::Unit> promise) = 0;
-  virtual void get_block_signatures(ConstBlockHandle handle, td::Promise<td::Ref<BlockSignatureSet>> promise) = 0;
+  virtual void store_block_signatures(BlockHandle handle, td::Ref<block::BlockSignatureSet> data,
+                                      Ref<block::ValidatorSet> vset, td::Promise<td::Unit> promise) = 0;
+  virtual void get_block_signatures(ConstBlockHandle handle,
+                                    td::Promise<td::Ref<block::BlockSignatureSet>> promise) = 0;
 
   virtual void store_block_proof(BlockHandle handle, td::Ref<Proof> proof, td::Promise<td::Unit> promise) = 0;
   virtual void get_block_proof(ConstBlockHandle handle, td::Promise<td::Ref<Proof>> promise) = 0;
@@ -44,17 +45,12 @@ class Db : public td::actor::Actor {
   virtual void store_block_proof_link(BlockHandle handle, td::Ref<ProofLink> proof, td::Promise<td::Unit> promise) = 0;
   virtual void get_block_proof_link(ConstBlockHandle handle, td::Promise<td::Ref<ProofLink>> promise) = 0;
 
-  virtual void store_block_candidate(BlockCandidate candidate, td::Promise<td::Unit> promise) = 0;
-  virtual void get_block_candidate(ton::PublicKey source, BlockIdExt id, FileHash collated_data_file_hash,
-                                   td::Promise<BlockCandidate> promise) = 0;
-  virtual void get_block_candidate_by_block_id(BlockIdExt id, td::Promise<BlockCandidate> promise) = 0;
-
-  virtual void store_block_state(BlockHandle handle, td::Ref<ShardState> state,
+  virtual void store_block_state(BlockHandle handle, td::Ref<ShardState> state, vm::StoreCellHint hint,
                                  td::Promise<td::Ref<ShardState>> promise) = 0;
   virtual void store_block_state_from_data(BlockHandle handle, td::Ref<BlockData> block,
                                            td::Promise<td::Ref<ShardState>> promise) = 0;
-  virtual void store_block_state_from_data_preliminary(std::vector<td::Ref<BlockData>> blocks,
-                                                 td::Promise<td::Unit> promise) = 0;
+  virtual void store_block_state_from_data_bulk(std::vector<td::Ref<BlockData>> blocks,
+                                                td::Promise<td::Unit> promise) = 0;
   virtual void get_block_state(ConstBlockHandle handle, td::Promise<td::Ref<ShardState>> promise) = 0;
   virtual void store_block_state_part(BlockId effective_block, td::Ref<vm::Cell> cell,
                                       td::Promise<td::Ref<vm::DataCell>> promise) = 0;
@@ -65,7 +61,7 @@ class Db : public td::actor::Actor {
                                            td::Promise<td::Unit> promise) = 0;
   virtual void store_persistent_state_file_gen(BlockIdExt block_id, BlockIdExt masterchain_block_id,
                                                PersistentStateType type,
-                                               std::function<td::Status(td::FileFd&)> write_data,
+                                               std::function<td::Status(td::FileFd &)> write_data,
                                                td::Promise<td::Unit> promise) = 0;
   virtual void get_persistent_state_file(BlockIdExt block_id, BlockIdExt masterchain_block_id, PersistentStateType type,
                                          td::Promise<td::BufferSlice> promise) = 0;
@@ -103,10 +99,6 @@ class Db : public td::actor::Actor {
   virtual void update_shard_client_state(BlockIdExt masterchain_block_id, td::Promise<td::Unit> promise) = 0;
   virtual void get_shard_client_state(td::Promise<BlockIdExt> promise) = 0;
 
-  virtual void update_destroyed_validator_sessions(std::vector<ValidatorSessionId> sessions,
-                                                   td::Promise<td::Unit> promise) = 0;
-  virtual void get_destroyed_validator_sessions(td::Promise<std::vector<ValidatorSessionId>> promise) = 0;
-
   virtual void update_async_serializer_state(AsyncSerializerState state, td::Promise<td::Unit> promise) = 0;
   virtual void get_async_serializer_state(td::Promise<AsyncSerializerState> promise) = 0;
 
@@ -131,8 +123,10 @@ class Db : public td::actor::Actor {
   virtual void get_archive_slice(td::uint64 archive_id, td::uint64 offset, td::uint32 limit,
                                  td::Promise<td::BufferSlice> promise) = 0;
   virtual void set_async_mode(bool mode, td::Promise<td::Unit> promise) = 0;
+  virtual void add_handle_to_archive(BlockHandle handle, td::Promise<td::Unit> promise) = 0;
+  virtual void set_archive_current_shard_split_depth(td::uint32 value) = 0;
 
-  virtual void run_gc(UnixTime mc_ts, UnixTime gc_ts, double archive_ttl) = 0;
+  virtual void run_gc(Ref<MasterchainState> shard_client_state, UnixTime gc_ts, double archive_ttl) = 0;
 
   virtual void add_persistent_state_description(td::Ref<PersistentStateDescription> desc,
                                                 td::Promise<td::Unit> promise) = 0;

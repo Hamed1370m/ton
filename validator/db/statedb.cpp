@@ -16,11 +16,12 @@
 
     Copyright 2017-2020 Telegram Systems LLP
 */
-#include "statedb.hpp"
-#include "ton/ton-tl.hpp"
 #include "adnl/utils.hpp"
 #include "td/db/RocksDb.h"
 #include "ton/ton-shard.h"
+#include "ton/ton-tl.hpp"
+
+#include "statedb.hpp"
 
 namespace ton {
 
@@ -116,36 +117,6 @@ void StateDb::get_shard_client_state(td::Promise<BlockIdExt> promise) {
   promise.set_value(create_block_id(obj->block_));
 }
 
-void StateDb::update_destroyed_validator_sessions(std::vector<ValidatorSessionId> sessions,
-                                                  td::Promise<td::Unit> promise) {
-  auto key = create_hash_tl_object<ton_api::db_state_key_destroyedSessions>();
-
-  kv_->begin_write_batch().ensure();
-  kv_->set(key.as_slice(), create_serialize_tl_object<ton_api::db_state_destroyedSessions>(std::move(sessions)))
-      .ensure();
-  kv_->commit_write_batch().ensure();
-
-  promise.set_value(td::Unit());
-}
-
-void StateDb::get_destroyed_validator_sessions(td::Promise<std::vector<ValidatorSessionId>> promise) {
-  auto key = create_hash_tl_object<ton_api::db_state_key_destroyedSessions>();
-
-  std::string value;
-  auto R = kv_->get(key.as_slice(), value);
-  R.ensure();
-
-  if (R.move_as_ok() == td::KeyValue::GetStatus::NotFound) {
-    promise.set_value(std::vector<ValidatorSessionId>{});
-    return;
-  }
-
-  auto F = fetch_tl_object<ton_api::db_state_destroyedSessions>(td::BufferSlice{value}, true);
-  F.ensure();
-  auto obj = F.move_as_ok();
-  promise.set_value(std::move(obj->sessions_));
-}
-
 void StateDb::update_async_serializer_state(AsyncSerializerState state, td::Promise<td::Unit> promise) {
   auto key = create_hash_tl_object<ton_api::db_state_key_asyncSerializer>();
 
@@ -184,13 +155,13 @@ void StateDb::update_hardforks(std::vector<BlockIdExt> blocks, td::Promise<td::U
 
   std::vector<tl_object_ptr<ton_api::tonNode_blockIdExt>> vec;
 
-  for (auto &e : blocks) {
+  for (auto& e : blocks) {
     vec.push_back(create_tl_block_id(e));
   }
 
   kv_->begin_write_batch().ensure();
   kv_->set(key.as_slice(), create_serialize_tl_object<ton_api::db_state_hardforks>(std::move(vec))).ensure();
-  kv_->commit_write_batch();
+  kv_->commit_write_batch().ensure();
 
   promise.set_value(td::Unit());
 }
@@ -210,7 +181,7 @@ void StateDb::get_hardforks(td::Promise<std::vector<BlockIdExt>> promise) {
   auto f = F.move_as_ok();
 
   std::vector<BlockIdExt> vec;
-  for (auto &e : f->blocks_) {
+  for (auto& e : f->blocks_) {
     vec.push_back(create_block_id(e));
   }
 
@@ -278,7 +249,7 @@ void StateDb::add_persistent_state_description(td::Ref<PersistentStateDescriptio
   list->list_.resize(new_size);
 
   bool can_be_stored_as_v1 = true;
-  for (auto const& [block_id, split_depth] : desc->shard_blocks) {
+  for (const auto& [block_id, split_depth] : desc->shard_blocks) {
     if (split_depth != 0) {
       can_be_stored_as_v1 = false;
       break;
@@ -289,14 +260,14 @@ void StateDb::add_persistent_state_description(td::Ref<PersistentStateDescriptio
 
   if (can_be_stored_as_v1) {
     std::vector<tl_object_ptr<ton_api::tonNode_blockIdExt>> shard_blocks;
-    for (auto const& [block_id, _] : desc->shard_blocks) {
+    for (const auto& [block_id, _] : desc->shard_blocks) {
       shard_blocks.push_back(create_tl_block_id(block_id));
     }
     serialized_shards =
         create_serialize_tl_object<ton_api::db_state_persistentStateDescriptionShards>(std::move(shard_blocks));
   } else {
     std::vector<tl_object_ptr<ton_api::db_state_persistentStateDescriptionShard>> shard_blocks;
-    for (auto const& [block_id, split_depth] : desc->shard_blocks) {
+    for (const auto& [block_id, split_depth] : desc->shard_blocks) {
       shard_blocks.push_back(create_tl_object<ton_api::db_state_persistentStateDescriptionShard>(
           create_tl_block_id(block_id), static_cast<td::int32>(split_depth)));
     }
@@ -349,16 +320,16 @@ void StateDb::get_persistent_state_descriptions(td::Promise<std::vector<td::Ref<
     F2.ensure();
     ton_api::downcast_call(*F2.ok().get(),
                            td::overloaded(
-                               [&](ton_api::db_state_persistentStateDescriptionShards const& shards) {
-                                 for (auto const& block : shards.shard_blocks_) {
+                               [&](const ton_api::db_state_persistentStateDescriptionShards& shards) {
+                                 for (const auto& block : shards.shard_blocks_) {
                                    desc.shard_blocks.push_back({
                                        .block = create_block_id(block),
                                        .split_depth = 0,
                                    });
                                  }
                                },
-                               [&](ton_api::db_state_persistentStateDescriptionShardsV2 const& shards) {
-                                 for (auto const& shard_description : shards.shard_blocks_) {
+                               [&](const ton_api::db_state_persistentStateDescriptionShardsV2& shards) {
+                                 for (const auto& shard_description : shards.shard_blocks_) {
                                    desc.shard_blocks.push_back({
                                        .block = create_block_id(shard_description->block_),
                                        .split_depth = static_cast<td::uint32>(shard_description->split_depth_),

@@ -18,14 +18,15 @@
 */
 #pragma once
 
-#include "td/utils/common.h"
-#include "td/utils/invoke.h"  // for tuple_for_each
-#include "td/utils/Slice.h"
-#include "td/utils/StringBuilder.h"
-
+#include <optional>
+#include <set>
 #include <tuple>
 #include <utility>
-#include <set>
+
+#include "td/utils/Slice.h"
+#include "td/utils/StringBuilder.h"
+#include "td/utils/common.h"
+#include "td/utils/invoke.h"  // for tuple_for_each
 
 namespace td {
 namespace format {
@@ -315,7 +316,7 @@ StringBuilder &operator<<(StringBuilder &sb, const Concat<T> &concat) {
 }
 
 template <class... ArgsT>
-auto concat(const ArgsT &... args) {
+auto concat(const ArgsT &...args) {
   return Concat<decltype(std::tie(args...))>{std::tie(args...)};
 }
 
@@ -339,18 +340,34 @@ Lambda<LambdaT> lambda(const LambdaT &lambda) {
 
 using format::tag;
 
-template <class A, class B>
+template <Formattable A, Formattable B>
 StringBuilder &operator<<(StringBuilder &sb, const std::pair<A, B> &p) {
   return sb << "[" << p.first << ";" << p.second << "]";
 }
 
-template <class T>
+template <Formattable T>
 StringBuilder &operator<<(StringBuilder &stream, const vector<T> &vec) {
   return stream << format::as_array(vec);
 }
-template <class T>
+template <Formattable T>
 StringBuilder &operator<<(StringBuilder &stream, const std::set<T> &vec) {
   return stream << format::as_array(vec);
+}
+
+template <Formattable T>
+StringBuilder &operator<<(StringBuilder &sb, const std::optional<T> &v) {
+  if (v.has_value()) {
+    return sb << *v;
+  }
+  return sb << "none";
+}
+
+template <Formattable T>
+StringBuilder &operator<<(StringBuilder &sb, const std::unique_ptr<T> &ptr) {
+  if (ptr) {
+    return sb << *ptr;
+  }
+  return sb << "nullptr";
 }
 
 }  // namespace td

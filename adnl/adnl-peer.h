@@ -18,13 +18,13 @@
 */
 #pragma once
 
+#include "auto/tl/ton_api.h"
+#include "dht/dht.h"
 #include "td/actor/actor.h"
 #include "td/utils/BufferedUdp.h"
 
-#include "dht/dht.h"
 #include "adnl-peer-table.h"
 #include "utils.hpp"
-#include "auto/tl/ton_api.h"
 
 namespace ton {
 
@@ -49,6 +49,7 @@ class AdnlPeerPair : public td::actor::Actor {
     vec.push_back(std::move(message));
     send_messages(std::move(vec));
   }
+  virtual void get_peer_node(td::Promise<AdnlNode> promise) = 0;
   static constexpr td::uint32 get_mtu() {
     return Adnl::get_mtu() + 128;
   }
@@ -60,6 +61,9 @@ class AdnlPeerPair : public td::actor::Actor {
   virtual void update_addr_list(AdnlAddressList addr_list) = 0;
   virtual void get_conn_ip_str(td::Promise<td::string> promise) = 0;
   virtual void get_stats(bool all, td::Promise<tl_object_ptr<ton_api::adnl_stats_peerPair>> promise) = 0;
+  // Drain this peer-pair's locally-accumulated inbound app-traffic delta into the peer table's
+  // aggregate, fulfilling `done` once the merge lands (see AdnlPeerTable::absorb).
+  virtual void collect_metrics(td::Promise<td::Unit> done) = 0;
 
   static td::actor::ActorOwn<AdnlPeerPair> create(td::actor::ActorId<AdnlNetworkManager> network_manager,
                                                   td::actor::ActorId<AdnlPeerTable> peer_table, td::uint32 local_mode,
